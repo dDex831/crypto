@@ -76,7 +76,7 @@ def fetch_klines(symbol, interval, limit=200):
       index: open_time (pd.Timestamp)
       columns: open, high, low, close, volume
     """
-    resp = client.query_kline(
+    resp = client.get_kline(
         symbol   = symbol,
         interval = interval,
         limit    = limit,
