@@ -1,5 +1,3 @@
-# auto_trade.py
-
 import os
 import json
 import requests
@@ -40,9 +38,6 @@ except FailedRequestError as e:
 SYMBOL      = "ADAUSDT"   # 交易对：ADA/USDT 永续合约（用于下单）
 FETCH_LIMIT = 200         # 拉取最近 200 根 1 小时 K 线
 
-# 下单时要动态计算 “可用余额 × 杠杆 ÷ 标记价” 得出合约数
-LOT_SIZE    = None        
-
 # Stochastic 参数（Bar 数量）
 STOCH_K     = 14
 STOCH_D     = 3
@@ -69,20 +64,22 @@ def save_state(state):
 
 # ----------------------------
 # 5. 拉 K 线并转换成 pandas.DataFrame（使用 CryptoCompare 公共接口）
-#    增加了调试打印
+#    并转换成台湾本地时间 (Asia/Taipei)
 # ----------------------------
 def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
     """
     通过 CryptoCompare 公共 REST API 获取 ADA/USDT 小时 K 线，不带 API Key。
+    将 open_time 从 UTC 转成 Asia/Taipei 时区，让你直接看到台湾本地时间。
     返回 pandas.DataFrame:
-      index: open_time (pd.Timestamp)
+      index: open_time (pd.Timestamp with tz='Asia/Taipei')
       columns: open, high, low, close, volume
     参数：
-      symbol: "ADAUSDT"  -> 拆成 fsym="ADA" 和 tsym="USDT"
+      symbol: "ADAUSDT"  -> 我们会把它拆成 fsym="ADA" 和 tsym="USDT"
       limit: 最多返回几根历史 K 线，最大200
     """
-    fsym = symbol[:-4]   # "ADAUSDT" → "ADA"
-    tsym = symbol[-4:]   # "ADAUSDT" → "USDT"
+    # 拆成 fsym, tsym
+    fsym = symbol[:-4]   # "ADAUSDT" -> "ADA"
+    tsym = symbol[-4:]   # "ADAUSDT" -> "USDT"
 
     url = "https://min-api.cryptocompare.com/data/v2/histohour"
     params = {
@@ -112,8 +109,13 @@ def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
     ohlc_list = data["Data"]["Data"]
     df = pd.DataFrame(ohlc_list)
 
-    # 将 time（秒）转换成 pandas.Timestamp，并设为索引
-    df["open_time"] = pd.to_datetime(df["time"], unit="s")
+    # 首先把 "time"（Unix 秒）转成 UTC 时区的 Timestamp
+    df["open_time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+
+    # 再把它从 UTC 转到 Asia/Taipei
+    df["open_time"] = df["open_time"].dt.tz_convert("Asia/Taipei")
+
+    # 设成索引
     df = df.set_index("open_time")
 
     # 转成我们需要的列，并转换为 float
@@ -122,11 +124,11 @@ def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
         "high": df["high"].astype(float),
         "low":  df["low"].astype(float),
         "close": df["close"].astype(float),
-        # 使用 volumefrom 作为 volume
+        # 使用 volumefrom 做 volume
         "volume": df["volumefrom"].astype(float)
     }, index=df.index)
 
-    print(f"[{pd.Timestamp.now()}] ← 成功拿到 {len(df2)} 根 K 线，最后一根时间：{df2.index[-1]}, 收盘价：{df2['close'].iloc[-1]:.6f}")
+    print(f"[{pd.Timestamp.now()}] ← 成功拿到 {len(df2)} 根 K 线，最后一根时间（台北时区）：{df2.index[-1]}, 收盘价：{df2['close'].iloc[-1]:.6f}")
     return df2
 
 # ----------------------------
@@ -135,7 +137,7 @@ def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
 def calculate_lot_size(symbol: str, leverage: int) -> float:
     """
     1. 从 Bybit Wallet Balance API 拿到可用 USDT
-    2. 用最近一根 K 线收盘价当作“标记价”近似（从 CryptoCompare 拉的 K 线数据）
+    2. 用最近一根 K 线收盘价当作“标记价”近似
     3. 公式：lot_count = floor(available_usdt * leverage / mark_price)
     """
     balances = client.get_wallet_balance(coin="USDT")
@@ -211,7 +213,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
     curr_j     = df_ind["stoch_j"].iloc[-1]
     lower_band = df_ind["bb_lower"].iloc[-1]
 
-    print(f"[{pd.Timestamp.now()}] 最后一根 K 线时间: {last_idx}, 收盘价: {last_close:.6f}, 低: {last_low:.6f}, 成交量: {last_vol:.2f}")
+    print(f"[{pd.Timestamp.now()}] 最后一根 K 线时间 (台北时区): {last_idx}, 收盘价: {last_close:.6f}, 低: {last_low:.6f}, 成交量: {last_vol:.2f}")
     print(f"[{pd.Timestamp.now()}] %J 前:{prev_j:.2f}，当前:{curr_j:.2f}，BB 下轨: {lower_band:.6f}")
 
     # 8.1 原始买入条件：%J ≤ 15 且 跌破 BB 下轨、成交量放大、%J 向上、当根量 > 20M
