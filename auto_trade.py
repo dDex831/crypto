@@ -5,50 +5,50 @@ import json
 import pandas as pd
 import numpy as np
 
-# 从 pybit v2 开始，用 usdt_perpetual.HTTP 来调用 Bybit USDT 永续合约 REST API
-from pybit import usdt_perpetual
+# ❶ 把下面這行改成「unified_trading」裡的 HTTP
+from pybit.unified_trading import HTTP
 
 # ----------------------------
-# 1. 从环境变量读取 Bybit API Key/Secret
+# 1. 從環境變數讀取 Bybit API Key/Secret
 # ----------------------------
 BYBIT_API_KEY    = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    raise ValueError("请先在环境变量设定 BYBIT_API_KEY 和 BYBIT_API_SECRET")
+    raise ValueError("請先在環境變數設置 BYBIT_API_KEY 和 BYBIT_API_SECRET")
 
 # ----------------------------
-# 2. 初始化 Bybit HTTP 客户端 (USDT 永续合约，正式环境)
-#    如要测试，请用 endpoint='https://api-testnet.bybit.com'
+# 2. 初始化 Bybit HTTP 客戶端 (USDT 永續合約，正式環境)
+#    如果想跑 Testnet，把 endpoint 改成 "https://api-testnet.bybit.com"
 # ----------------------------
-client = usdt_perpetual.HTTP(
-    endpoint   = "https://api.bybit.com",
+client = HTTP(
     api_key    = BYBIT_API_KEY,
-    api_secret = BYBIT_API_SECRET
+    api_secret = BYBIT_API_SECRET,
+    endpoint   = "https://api.bybit.com"
 )
 
-# 2.1 设置杠杆为 3 倍（只需调用一次就生效）
+# 2.1 設定槓桿為 3 倍（只需呼叫一次就生效）
 client.set_leverage(symbol="ADAUSDT", leverage=3)
 
 # ----------------------------
-# 3. 参数设置
+# 3. 參數設定
 # ----------------------------
-SYMBOL      = "ADAUSDT"   # 交易对：ADA/USDT 永续合约
-TIMEFRAME   = "60"        # K 线周期：60 = 60 分钟
-FETCH_LIMIT = 200         # 拉取最近 200 根 60 分钟 K 线
+SYMBOL      = "ADAUSDT"   # 交易對：ADA/USDT 永續合約
+TIMEFRAME   = "60"        # K 線週期：60 = 60 分鐘 (1h)
+FETCH_LIMIT = 200         # 拉取最近 200 根 60 分鐘 K 線
 
-# 下单时会动态计算 LOT_SIZE（可用余额 × 杠杆 ÷ 标记价），先留空
+# 下單時會動態計算 LOT_SIZE（「可用餘額 × 槓桿 ÷ 標記價」），先留 None
 LOT_SIZE    = None        
 
-# Stochastic 参数（Bar 数量）
+# Stochastic 參數（Bar 數量）
 STOCH_K     = 14
 STOCH_D     = 3
 
-# Bollinger Band 参数（Bar 数量、标准差倍数）
+# Bollinger Band 參數（Bar 數量、標準差倍數）
 BB_LENGTH   = 20
 BB_MULT     = 2.0
 
 # ----------------------------
-# 4. 进场 / 持仓状态保存 (state.json)
+# 4. 進場／持倉狀態儲存 (state.json)
 # ----------------------------
 STATE_FILENAME = "state.json"
 
@@ -64,15 +64,15 @@ def save_state(state):
         json.dump(state, f)
 
 # ----------------------------
-# 5. 抓取 K 线并转成 pandas.DataFrame
+# 5. 抓取 K 線並轉成 pandas.DataFrame
 # ----------------------------
 def fetch_klines(symbol, interval, limit=200):
     """
-    Bybit REST API query_kline → 返回 DataFrame:
+    Bybit Unified Trading REST API query_kline → 返回 DataFrame:
       index: open_time (pd.Timestamp)
       columns: open, high, low, close, volume
     """
-    # 注意：usdt_perpetual.HTTP.query_kline 对应新版 pybit v2
+    # ❷ 這裡用的是 unified_trading.HTTP.query_kline
     resp = client.query_kline(
         symbol   = symbol,
         interval = interval,
@@ -80,7 +80,7 @@ def fetch_klines(symbol, interval, limit=200):
         _unified = True
     )
     if "result" not in resp or not isinstance(resp["result"], list):
-        raise RuntimeError(f"query_kline 返回格式异常: {resp}")
+        raise RuntimeError(f"query_kline 回傳格式異常: {resp}")
     data = resp["result"]
     df = pd.DataFrame(data)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
@@ -90,48 +90,48 @@ def fetch_klines(symbol, interval, limit=200):
     return df
 
 # ----------------------------
-# 6. 计算可用余额并动态算出下单合约数
+# 6. 計算可用餘額並動態算出下單合約數
 # ----------------------------
 def calculate_lot_size(symbol, leverage):
     """
-    1. 从钱包余额 API 拿到可用的 USDT
-    2. 用最近一根 K 线收盘价当作标记价 (近似)
+    1. 先從錢包餘額 API 拿到可用 USDT
+    2. 用最近一根 K 線收盤價當作「標記價」近似
     3. 公式：lot = floor(available_usdt × leverage / mark_price)
     """
     balances = client.get_wallet_balance(coin="USDT")
     if "result" not in balances or "USDT" not in balances["result"]:
-        raise RuntimeError(f"get_wallet_balance 返回异常: {balances}")
+        raise RuntimeError(f"get_wallet_balance 返回異常: {balances}")
     available_usdt = float(balances["result"]["USDT"]["available_balance"])
 
-    # 拿最近 5 根 K 线，取最后那根的收盘价近似当作标记价
+    # 再用最近 5 根 K 線收盤價當作標記價
     klines = fetch_klines(symbol, TIMEFRAME, limit=5)
     mark_price = klines["close"].iloc[-1]
 
     raw_size = (available_usdt * leverage) / mark_price
-    # 对 ADAUSDT 永续合约，一般精度到小数后 3 位
+    # 對 ADAUSDT 永續合約，一般精度到小數點後 3 位
     size = float(f"{raw_size:.3f}")
     return size
 
 # ----------------------------
-# 7. 手动计算 Stochastic 和 Bollinger Band
+# 7. 用純 pandas+numpy 手動計算 Stochastic 和 Bollinger Band
 # ----------------------------
 def compute_indicators(df):
     """
-    输入 df: 包含 open, high, low, close, volume
-    输出 df: 新增 stoch_k, stoch_d, stoch_j, bb_lower
+    輸入 df: 包含 open, high, low, close, volume
+    輸出 df: 新增 stoch_k, stoch_d, stoch_j, bb_lower
     """
-    # 7.1 Stochastic %K = (C - LL) / (HH - LL) × 100
+    # 7.1 %K = (CLOSE - N 期內最低價) / (N 期內最高價 - N 期內最低價) × 100
     low_n   = df["low"].rolling(window=STOCH_K).min()
     high_n  = df["high"].rolling(window=STOCH_K).max()
     stoch_k = (df["close"] - low_n) / (high_n - low_n) * 100
 
-    # 7.2 %D = %K 的 STOCH_D 期简单移动平均
+    # 7.2 %D = %K 的 3 期 SMA
     stoch_d = stoch_k.rolling(window=STOCH_D).mean()
 
-    # 7.3 %J = 3 × %K − 2 × %D
+    # 7.3 %J = 3×%K - 2×%D
     stoch_j = 3 * stoch_k - 2 * stoch_d
 
-    # 7.4 Bollinger Band: 中轨 = MA20 ，下轨 = MA20 - 2 × σ20
+    # 7.4 Bollinger Band 下軌 = MA20 - 2×StdDev20
     ma20    = df["close"].rolling(window=BB_LENGTH).mean()
     std20   = df["close"].rolling(window=BB_LENGTH).std()
     bb_lower= ma20 - BB_MULT * std20
@@ -144,21 +144,21 @@ def compute_indicators(df):
     return df_
 
 # ----------------------------
-# 8. 核心策略逻辑
+# 8. 核心策略邏輯
 # ----------------------------
 def strategy_logic(df, state):
     in_position = state["in_position"]
     entry_price = state["entry_price"]
     entry_time  = state["entry_time"]
 
-    # 如果 Bar 数量不足，先不操作
+    # 如果 Bar 數量不足，就先不下單
     if len(df) < max(STOCH_K, BB_LENGTH) + 2:
         return state
 
-    # 计算所有指标
+    # 計算所有指標
     df_ind = compute_indicators(df)
 
-    # 把最后一根 Bar 的数据取出来
+    # 取最後一根 K 線資料
     last_idx   = df_ind.index[-1]
     last_open  = df_ind["open"].iloc[-1]
     last_close = df_ind["close"].iloc[-1]
@@ -169,7 +169,7 @@ def strategy_logic(df, state):
     curr_j     = df_ind["stoch_j"].iloc[-1]
     lower_band = df_ind["bb_lower"].iloc[-1]
 
-    # 8.1 原始进场条件：%J ≤ 15 && 跌破布林带下轨 && 成交量放大 && %J 向上 && 当根量 > 20M
+    # 8.1 原始進場：%J ≤ 15 且 跌破 BB 下軌、成交量放大、%J 向上、當根量 > 20M
     cond_j_low       = curr_j <= 15
     cond_broken_bb   = last_low < lower_band
     cond_vol_up      = last_vol > prev_vol
@@ -177,15 +177,15 @@ def strategy_logic(df, state):
     cond_vol_over20m = last_vol > 20_000_000
     buy_cond         = cond_j_low and cond_broken_bb and cond_vol_up and cond_j_rising and cond_vol_over20m
 
-    # 8.2 或者当根跌幅 ≥ 7% 也算买入
+    # 8.2 或者 Bar 跌幅 ≥ 7% ( (open-close)/open*100 ) 也算買入
     bar_drop = ((last_open - last_close) / last_open * 100) >= 7
     final_buy_cond = buy_cond or bar_drop
 
     size = None
-    # 8.3 如果没持仓且满足买入条件 → 全仓 3 倍杠杆下多单
+    # 8.3 如果目前無持倉且滿足進場條件 → 全倉 3 倍槓桿下多單
     if (not in_position) and final_buy_cond:
         size = calculate_lot_size(SYMBOL, leverage=3)
-        print(f"[{last_idx}] 进场信号成立 → 杠杆×3 下单，合约数={size}, 价格≈{last_close}")
+        print(f"[{last_idx}] 進場信號成立 → 槓桿×3 下單，合約數={size}, 價格≈{last_close}")
         resp = client.place_active_order(
             symbol           = SYMBOL,
             side             = "Buy",
@@ -195,22 +195,22 @@ def strategy_logic(df, state):
             reduce_only      = False,
             close_on_trigger = False
         )
-        print("多单下单响应：", resp)
+        print("多單下單回應：", resp)
         in_position = True
         entry_price = last_close
         entry_time  = last_idx.strftime("%Y-%m-%d %H:%M:%S")
 
-    # 8.4 如果已持仓，检查平仓条件
+    # 8.4 如果已持倉，檢查平倉
     elif in_position:
-        # 如果之前没算 size，就在这里再算一次
         if size is None:
+            # 如果上面買入時沒記 size，就在這裡再算一次
             size = calculate_lot_size(SYMBOL, leverage=3)
 
         profit_pct = (last_close - entry_price) / entry_price * 100
 
-        # 条件 A：盈利 ≥ 1.5% → 平仓
+        # (A) 獲利 ≥ 1.5% → 平倉
         if profit_pct >= 1.5:
-            print(f"[{last_idx}] 盈利 {profit_pct:.2f}% ≥ 1.5%，市价平仓 Sell")
+            print(f"[{last_idx}] 獲利 {profit_pct:.2f}% ≥ 1.5%，市價平倉 Sell")
             resp = client.place_active_order(
                 symbol           = SYMBOL,
                 side             = "Sell",
@@ -220,16 +220,16 @@ def strategy_logic(df, state):
                 reduce_only      = False,
                 close_on_trigger = False
             )
-            print("空单平仓响应：", resp)
+            print("空單平倉回應：", resp)
             in_position = False
             entry_price = None
             entry_time  = None
 
-        # 条件 B：持仓 ≥ 3 天 (4320 分钟) 且收盘价回本 → 平仓
+        # (B) 持倉 ≥ 3 天 (4320 分鐘) 且收盤價 == 進場價 → 平倉
         if entry_time:
             held_minutes = (pd.to_datetime(last_idx) - pd.to_datetime(entry_time)).total_seconds() / 60
             if held_minutes >= 4320 and abs(last_close - entry_price) < 1e-8:
-                print(f"[{last_idx}] 持仓 {held_minutes/60:.1f} 小时 (>72 小时) 且回本 → 平仓")
+                print(f"[{last_idx}] 持倉 {held_minutes/60:.1f} 小時 (>72 小時) 且回本 → 平倉")
                 resp = client.place_active_order(
                     symbol           = SYMBOL,
                     side             = "Sell",
@@ -239,12 +239,12 @@ def strategy_logic(df, state):
                     reduce_only      = False,
                     close_on_trigger = False
                 )
-                print("3 天回本平仓响应：", resp)
+                print("3 天回本平倉回應：", resp)
                 in_position = False
                 entry_price = None
                 entry_time  = None
 
-    # 8.5 更新并返回最新持仓状态
+    # 8.5 更新並回傳最新持倉狀態
     new_state = {
         "in_position": in_position,
         "entry_price": entry_price,
@@ -253,7 +253,7 @@ def strategy_logic(df, state):
     return new_state
 
 # ----------------------------
-# 9. 主程序：拉 K 线 → 执行策略 → 下单 → 更新 state.json
+# 9. 主程式：拉 K 線 → 執行策略 → 下單 → 更新 state.json
 # ----------------------------
 def main():
     state = load_state()
@@ -263,8 +263,9 @@ def main():
         if new_state != state:
             save_state(new_state)
     except Exception as e:
-        print("执行过程中出错：", str(e))
-        raise  # 让 Actions 收到非零退出码，方便你看到失败日志
+        print("執行過程出錯：", str(e))
+        # 抛出异常讓 Actions 返回非零碼，方便你在 GitHub Actions log 裡看到 Failure
+        raise
 
 if __name__ == "__main__":
     main()
