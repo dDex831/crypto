@@ -38,8 +38,8 @@ except FailedRequestError as e:
 # 3. 参数设置
 # ----------------------------
 SYMBOL      = "ADAUSDT"   # 交易对：ADA/USDT 永续合约
-TIMEFRAME   = "60"        # K 线周期：60 = 60 分钟 (1h)
-FETCH_LIMIT = 200         # 拉取最近 200 根 60 分钟 K 线
+TIMEFRAME   = "1h"        # Binance 1 小时 K 线标记为 "1h"
+FETCH_LIMIT = 200         # 拉取最近 200 根 1 小时 K 线
 
 # 下单时要动态计算 “可用余额 × 杠杆 ÷ 标记价” 得出合约数
 LOT_SIZE    = None        
@@ -69,17 +69,19 @@ def save_state(state):
         json.dump(state, f)
 
 # ----------------------------
-# 5. 拉 K 线并转换成 pandas.DataFrame（使用 Bybit v2 公共接口）
-#    v2 endpoint: https://api.bybit.com/public/linear/kline
+# 5. 拉 K 线并转换成 pandas.DataFrame（改用 Binance 公共接口）
 # ----------------------------
-def fetch_klines(symbol, interval, limit=200):
+def fetch_klines_binance(symbol, interval, limit=200):
     """
-    直接调用 Bybit v2 公共 K-line 接口，不带 API Key（避开 v5 被 CloudFront 阻挡）。
+    通过 Binance 公共 REST API 获取 K 线，不带 API Key。
+    symbol: 像 "ADAUSDT"
+    interval: 像 "1h"、"4h"、"1d" 等，这里我们用 "1h"
+    limit: 最多获取多少根 K 线
     返回 pandas.DataFrame:
       index: open_time (pd.Timestamp)
       columns: open, high, low, close, volume
     """
-    url = "https://api.bybit.com/public/linear/kline"
+    url = "https://api.binance.com/api/v3/klines"
     params = {
         "symbol": symbol,
         "interval": interval,
@@ -89,53 +91,51 @@ def fetch_klines(symbol, interval, limit=200):
     try:
         r = requests.get(url, params=params, timeout=10)
     except Exception as e:
-        raise RuntimeError(f"调用 Bybit v2 公共 K-line 接口时网络错误: {e}")
+        raise RuntimeError(f"调用 Binance K-line 接口时网络错误: {e}")
 
-    # 检查 HTTP 状态码
     if r.status_code != 200:
-        raise RuntimeError(f"Bybit v2 公共 K-line HTTP 错误: Status {r.status_code}, Response: {r.text}")
+        raise RuntimeError(f"Binance K-line HTTP 错误: Status {r.status_code}, Response: {r.text}")
 
-    # 尝试解析 JSON
     try:
-        resp = r.json()
+        data = r.json()
     except Exception as e:
-        raise RuntimeError(f"Bybit v2 公共 K-line 返回无法解析为 JSON: {e} | Raw Response: {r.text}")
+        raise RuntimeError(f"Binance K-line 返回无法解析为 JSON: {e} | Raw Response: {r.text}")
 
-    # Bybit v2 返回示例:
-    # {
-    #   "ret_code": 0,
-    #   "ret_msg": "OK",
-    #   "ext_code": "",
-    #   "ext_info": "",
-    #   "result": [
-    #       {
-    #         "open_time": 1690000000,
-    #         "open": "0.5000",
-    #         "high": "0.5100",
-    #         "low": "0.4950",
-    #         "close": "0.5050",
-    #         "volume": "12345.67"
-    #       },
-    #       ...
-    #   ],
-    #   "time_now": "1690001234.567890"
-    # }
-    if resp.get("ret_code") != 0 or "result" not in resp or not isinstance(resp["result"], list):
-        raise RuntimeError(f"Bybit v2 公共 K-line 返回格式异常: {resp}")
+    # Binance 返回格式: 每一条 K 线是一个 list，内容为:
+    # [
+    #   0: openTime (毫秒),
+    #   1: open,
+    #   2: high,
+    #   3: low,
+    #   4: close,
+    #   5: volume,
+    #   6: closeTime,
+    #   7: quoteAssetVolume,
+    #   8: numberOfTrades,
+    #   9: takerBuyBaseAssetVolume,
+    #   10: takerBuyQuoteAssetVolume,
+    #   11: ignore
+    # ]
+    # 我们只取前 6 列。
+    df = pd.DataFrame(data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quoteAssetVolume", "numTrades",
+        "takerBuyBase", "takerBuyQuote", "ignore"
+    ])
 
-    data_list = resp["result"]
-    df = pd.DataFrame(data_list)
-
-    # 将 open_time（秒）转换为毫秒，然后转为 pandas Timestamp
-    # v2 返回的 open_time 单位为秒 (e.g. 1690000000)，要乘以1000
-    df["open_time"] = pd.to_datetime(df["open_time"] * 1000, unit="ms")
+    # 把 open_time(ms) 转成 pandas 的 Timestamp
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df = df.set_index("open_time")
 
-    # 转换数值列为 float
+    # 转换数值类型
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
 
-    return df
+    # 返回只包含我们关注的列
+    return df[["open", "high", "low", "close", "volume"]]
+
+# 把 fetch_klines_binance 简写成 fetch_klines
+fetch_klines = fetch_klines_binance
 
 # ----------------------------
 # 6. 计算可用余额并返回可下单合约数
@@ -143,7 +143,7 @@ def fetch_klines(symbol, interval, limit=200):
 def calculate_lot_size(symbol, leverage):
     """
     1. 从钱包余额 API 拿到可用 USDT
-    2. 用最近一根 K 线收盘价当作“标记价”近似
+    2. 用最近一根 K 线收盘价当作“标记价”近似（从 Binance 拉的 K 线数据）
     3. 公式：lot_count = floor(available_usdt * leverage / mark_price)
     """
     balances = client.get_wallet_balance(coin="USDT")
@@ -151,7 +151,7 @@ def calculate_lot_size(symbol, leverage):
         raise RuntimeError(f"get_wallet_balance 返回异常: {balances}")
     available_usdt = float(balances["result"]["USDT"]["available_balance"])
 
-    # 拿最近 5 根 60 分 K 线，最后一根收盘价当作标记价
+    # 拿最近 5 根 1h K 线，最后一根的 close 当作标记价
     klines = fetch_klines(symbol, TIMEFRAME, limit=5)
     mark_price = klines["close"].iloc[-1]
 
