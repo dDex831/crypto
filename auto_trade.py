@@ -6,9 +6,7 @@ import requests
 import pandas as pd
 import numpy as np
 
-from pybit.unified_trading import HTTP as BybitV5HTTP
-from pybit.exceptions import FailedRequestError
-from pybit import usdt_perpetual   # v2 客户端，用于 TEST_ORDER 下单
+from pybit import HTTP as BybitV2HTTP  # 使用 v2 客户端
 
 # ----------------------------
 # 1. 从环境变量读取 Bybit API Key/Secret
@@ -24,53 +22,33 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 TEST_ORDER = os.getenv("TEST_ORDER", "false").lower() == "true"
 
 # ----------------------------
-# 2. v5 客户端：用于策略模式下的拉 K 线 & 下单（如果不被 IP 限制）
+# 2. 用 pybit v2 建立 HTTP 客户端 (USDT 永续合约)
+#    endpoint 指向正式网
 # ----------------------------
-client_v5 = BybitV5HTTP(
-    testnet=False,
-    api_key    = BYBIT_API_KEY,
-    api_secret = BYBIT_API_SECRET
-)
-
-# ----------------------------
-# 2.1 v2 客户端：仅用于 TEST_ORDER 下单
-# ----------------------------
-# v2 HTTP endpoint 指向正式网
-client_v2 = usdt_perpetual.HTTP(
+client = BybitV2HTTP(
     endpoint   = "https://api.bybit.com",
     api_key    = BYBIT_API_KEY,
     api_secret = BYBIT_API_SECRET
 )
 
 # ----------------------------
-# 3. 先设杠杆 3 倍（v2 或 v5 随机走，若被限流打印警告）
+# 3. 先设杠杆 3 倍
+#    v2 set_leverage 需要 buy_leverage 和 sell_leverage
 # ----------------------------
-def ensure_leverage_v2():
+def ensure_leverage():
     try:
-        # v2 set_leverage 需要同时指定 Buy/Sell
-        client_v2.set_leverage(symbol="ADAUSDT", buy_leverage=3, sell_leverage=3)
-        print(f"[{pd.Timestamp.now()}] v2 杠杆设置成功：ADAUSDT = 3 倍")
+        client.set_leverage(symbol="ADAUSDT", buy_leverage=3, sell_leverage=3)
+        print(f"[{pd.Timestamp.now()}] 杠杆设置成功：ADAUSDT = 3 倍")
     except Exception as e:
-        print(f"[{pd.Timestamp.now()}] Warning(v2): 设置杠杆时出错，已跳过。错误信息：{e}")
+        print(f"[{pd.Timestamp.now()}] Warning: 设置杠杆时发生错误，已跳过。错误信息：{e}")
 
-def ensure_leverage_v5():
-    try:
-        client_v5.set_leverage(symbol="ADAUSDT", leverage=3)
-        print(f"[{pd.Timestamp.now()}] v5 杠杆设置成功：ADAUSDT = 3 倍")
-    except FailedRequestError as e:
-        print(f"[{pd.Timestamp.now()}] Warning(v5): 设置杠杆时发生错误，已跳过。错误信息：{e}")
-
-if TEST_ORDER:
-    print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式开启，先调用 v2 设置杠杆 3 倍。")
-    ensure_leverage_v2()
-else:
-    print(f"[{pd.Timestamp.now()}] 普通模式，先调用 v5 设置杠杆 3 倍。")
-    ensure_leverage_v5()
+print(f"[{pd.Timestamp.now()}] 初始化：即将设置杠杆 3 倍。")
+ensure_leverage()
 
 # ----------------------------
 # 4. 参数设置
 # ----------------------------
-SYMBOL      = "ADAUSDT"   # 交易对：ADA/USDT 永续合约（用于下单）
+SYMBOL      = "ADAUSDT"   # 交易对：ADA/USDT 永续合约
 FETCH_LIMIT = 200         # 拉取最近 200 根 1 小时 K 线
 
 # Stochastic 参数（Bar 数量）
@@ -145,10 +123,8 @@ def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
 
     # 把 "time"（Unix 秒）转成 UTC 时区的 Timestamp
     df["open_time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-
     # 再把它从 UTC 转到 Asia/Taipei
     df["open_time"] = df["open_time"].dt.tz_convert("Asia/Taipei")
-
     # 设成索引
     df = df.set_index("open_time")
 
@@ -170,11 +146,11 @@ def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
 # ----------------------------
 def calculate_lot_size(symbol: str, leverage: int) -> float:
     """
-    1. 从 Bybit Wallet Balance API 拿到可用 USDT (v5)
+    1. 从 Bybit v2 Wallet Balance API 拿到可用 USDT
     2. 用最近一根 K 线收盘价当作“标记价”近似
     3. 公式：lot_count = floor(available_usdt * leverage / mark_price)
     """
-    balances = client_v5.get_wallet_balance(coin="USDT")
+    balances = client.get_wallet_balance(coin="USDT")
     if "result" not in balances or "USDT" not in balances["result"]:
         raise RuntimeError(f"get_wallet_balance 返回异常: {balances}")
     available_usdt = float(balances["result"]["USDT"]["available_balance"])
@@ -268,7 +244,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
         print(f"[{pd.Timestamp.now()}] 买入条件满足，准备下多单。")
         size = calculate_lot_size(SYMBOL, leverage=3)
         print(f"[{pd.Timestamp.now()}] → 下单信息：杠杆×3，合约数={size:.3f}, 价格≈{last_close:.6f}")
-        resp = client_v5.place_active_order(
+        resp = client.place_active_order(
             symbol           = SYMBOL,
             side             = "Buy",
             order_type       = "Market",
@@ -294,7 +270,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
         # (A) 如果盈利 ≥ 1.5% → 平仓
         if profit_pct >= 1.5:
             print(f"[{pd.Timestamp.now()}] 盈利 ≥ 1.5%，市价平仓 Sell。")
-            resp = client_v5.place_active_order(
+            resp = client.place_active_order(
                 symbol           = SYMBOL,
                 side             = "Sell",
                 order_type       = "Market",
@@ -313,7 +289,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
             held_minutes = (pd.to_datetime(last_idx) - pd.to_datetime(entry_time)).total_seconds() / 60
             if held_minutes >= 4320 and abs(last_close - entry_price) < 1e-8:
                 print(f"[{pd.Timestamp.now()}] 持仓 {held_minutes/60:.1f} 小时 (>72 小时) 且回本 → 平仓。")
-                resp = client_v5.place_active_order(
+                resp = client.place_active_order(
                     symbol           = SYMBOL,
                     side             = "Sell",
                     order_type       = "Market",
@@ -343,15 +319,15 @@ def main():
     state = load_state()
     print(f"[{pd.Timestamp.now()}] 当前持仓状态: {state}")
 
-    # 如果 TEST_ORDER=True，就直接用 v2 客户端市价买入 5 合约，然后结束脚本
+    # 如果 TEST_ORDER=True，就直接市价买入 5 合约，然后结束脚本
     if TEST_ORDER:
-        print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)，已设杠杆 3 倍（v2）。")
+        print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)，已设杠杆 3 倍。")
         try:
-            resp = client_v2.place_active_order(
+            resp = client.place_active_order(
                 symbol           = SYMBOL,
                 side             = "Buy",
                 order_type       = "Market",
-                qty              = 5,                # 固定下 5 合约
+                qty              = 5,               # 固定下 5 合约
                 time_in_force    = "GoodTillCancel",
                 reduce_only      = False,
                 close_on_trigger = False
