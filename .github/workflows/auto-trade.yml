@@ -21,8 +21,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # 添加 requests 和 numpy，因为 fetch_klines() 里会用到 requests，
-          # compute_indicators() 里会用到 numpy
+          # 加上 requests 和 numpy，因为 fetch_klines() 会用到 requests，compute_indicators() 会用到 numpy
           pip install pandas pybit requests numpy
 
       - name: Run auto_trade.py

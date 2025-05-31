@@ -70,6 +70,7 @@ def save_state(state):
 
 # ----------------------------
 # 5. 拉 K 线并转换成 pandas.DataFrame（使用 Bybit 公共接口）
+#    增加了对 HTTP 状态码的检查与更详细的错误提示。
 # ----------------------------
 def fetch_klines(symbol, interval, limit=200):
     """
@@ -87,27 +88,28 @@ def fetch_klines(symbol, interval, limit=200):
 
     try:
         r = requests.get(url, params=params, timeout=10)
+    except Exception as e:
+        # 网络层面请求失败（超时、DNS 无法解析等）
+        raise RuntimeError(f"调用 Bybit 公共 K-line 接口时网络错误: {e}")
+
+    # 先检查 HTTP 状态码
+    if r.status_code != 200:
+        # 如果状态码不是 200，就把状态码和响应文本都打印出来
+        raise RuntimeError(f"Bybit 公共 K-line HTTP 错误: Status {r.status_code}, Response: {r.text}")
+
+    # 尝试解析 JSON
+    try:
         resp = r.json()
     except Exception as e:
-        raise RuntimeError(f"调用 Bybit 公共 K-line 失败: {e}")
+        # 返回内容不是合法 JSON
+        raise RuntimeError(f"Bybit 公共 K-line 返回无法解析为 JSON: {e} | Raw Response: {r.text}")
 
-    # Bybit v5 公共 K-line 返回示例:
-    # {
-    #   "retCode": 0,
-    #   "retMsg": "OK",
-    #   "result": {
-    #       "list": [
-    #           [<open_time(ms)>, <open>, <high>, <low>, <close>, <volume>, <turnover>],
-    #           ...
-    #       ],
-    #       "category": "linear_perpetual"
-    #   },
-    #   "time": 1690000000000
-    # }
+    # 检查 retCode 和 result.list 是否存在
     if resp.get("retCode") != 0 or "result" not in resp or "list" not in resp["result"]:
         raise RuntimeError(f"Bybit 公共 K-line 返回格式异常: {resp}")
 
     raw_list = resp["result"]["list"]
+    # raw_list 中每一项格式：[open_time(ms), open, high, low, close, volume, turnover]
     df = pd.DataFrame(raw_list, columns=[
         "open_time", "open", "high", "low", "close", "volume", "turnover"
     ])
@@ -116,7 +118,7 @@ def fetch_klines(symbol, interval, limit=200):
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df = df.set_index("open_time")
 
-    # 只保留需要的列，并转换为 float
+    # 只保留我们需要的列，并转换为 float
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
 
