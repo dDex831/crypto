@@ -18,14 +18,13 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise ValueError("请先在环境变量设定 BYBIT_API_KEY 和 BYBIT_API_SECRET")
 
 # ----------------------------
-# 是否启用“测试下单模式”：直接下市价单 5 合约
+# 是否启用“测试下单模式”：直接下市价单 5 合约（3 倍杠杆）
 # ----------------------------
 TEST_ORDER = os.getenv("TEST_ORDER", "false").lower() == "true"
 
 # ----------------------------
 # 2. 用新版 Pybit v5 建立 HTTP 客户端 (USDT 永续合约)
 #    如果要跑 Testnet，把 testnet=True
-#    仅用于正常策略模式；TEST_ORDER 时另建 v2 客户端
 # ----------------------------
 client_v5 = BybitV5HTTP(
     testnet=False,
@@ -34,16 +33,21 @@ client_v5 = BybitV5HTTP(
 )
 
 # ----------------------------
-# 2.1 如果不是 TEST_ORDER，就尝试设置杠杆为 3 倍
+# 2.1 如果不是 TEST_ORDER，就尝试设置杠杆为 3 倍；
+#     如果是 TEST_ORDER，也要先设置杠杆为 3 倍再下单
 # ----------------------------
-if not TEST_ORDER:
+def ensure_leverage():
     try:
         client_v5.set_leverage(symbol="ADAUSDT", leverage=3)
         print(f"[{pd.Timestamp.now()}] 杠杆设置成功：ADAUSDT = 3 倍")
     except FailedRequestError as e:
         print(f"[{pd.Timestamp.now()}] Warning: 设置杠杆时发生错误，已跳过。错误信息：{e}")
+
+if TEST_ORDER:
+    print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式开启，准备先设置杠杆 3 倍再下单。")
+    ensure_leverage()
 else:
-    print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式开启，跳过杠杆设置。")
+    ensure_leverage()
 
 # ----------------------------
 # 3. 参数设置
@@ -315,7 +319,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
 
 # ----------------------------
 # 9. 主程序：拉 K 线 → 或直接测试下单 → 执行策略 → 下单 → 更新 state.json
-#    增加调试打印 & TEST_ORDER 下单 5 合约
+#    增加调试打印 & TEST_ORDER 下单 5 合约（3 倍杠杆）
 # ----------------------------
 def main():
     state = load_state()
@@ -323,14 +327,9 @@ def main():
 
     # 如果 TEST_ORDER=True，就直接测试下单 5 合约，然后结束脚本
     if TEST_ORDER:
-        print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)。")
-        # 使用 v2 客户端下单
-        from pybit import HTTP as BybitV2HTTP
-        client_v2 = BybitV2HTTP("https://api.bybit.com",
-                                api_key    = BYBIT_API_KEY,
-                                api_secret = BYBIT_API_SECRET)
+        print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)，已设杠杆 3 倍。")
         try:
-            resp = client_v2.place_active_order(
+            resp = client_v5.place_active_order(
                 symbol           = SYMBOL,
                 side             = "Buy",
                 order_type       = "Market",
