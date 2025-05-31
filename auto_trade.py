@@ -6,7 +6,7 @@ import requests
 import pandas as pd
 import numpy as np
 
-from pybit.unified_trading import HTTP
+from pybit.unified_trading import HTTP as BybitV5HTTP
 from pybit.exceptions import FailedRequestError
 
 # ----------------------------
@@ -17,26 +17,28 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise ValueError("请先在环境变量设定 BYBIT_API_KEY 和 BYBIT_API_SECRET")
 
+# ----------------------------
 # 是否启用“测试下单模式”：直接下市价单 5 合约
+# ----------------------------
 TEST_ORDER = os.getenv("TEST_ORDER", "false").lower() == "true"
 
 # ----------------------------
 # 2. 用新版 Pybit v5 建立 HTTP 客户端 (USDT 永续合约)
 #    如果要跑 Testnet，把 testnet=True
+#    仅用于正常策略模式；TEST_ORDER 时另建 v2 客户端
 # ----------------------------
-client = HTTP(
-    testnet=False,               # 正式网：False；要用测试网就改成 True
+client_v5 = BybitV5HTTP(
+    testnet=False,
     api_key    = BYBIT_API_KEY,
     api_secret = BYBIT_API_SECRET
 )
 
 # ----------------------------
-# 2.1 尝试设置杠杆为 3 倍，如果出错（IP 限制、API 权限等），捕获异常并继续
+# 2.1 如果不是 TEST_ORDER，就尝试设置杠杆为 3 倍
 # ----------------------------
-# 如果只是想测试下单 5 合约，这里可以不一定要设置杠杆，但为了演示保留如下代码
 if not TEST_ORDER:
     try:
-        client.set_leverage(symbol="ADAUSDT", leverage=3)
+        client_v5.set_leverage(symbol="ADAUSDT", leverage=3)
         print(f"[{pd.Timestamp.now()}] 杠杆设置成功：ADAUSDT = 3 倍")
     except FailedRequestError as e:
         print(f"[{pd.Timestamp.now()}] Warning: 设置杠杆时发生错误，已跳过。错误信息：{e}")
@@ -150,7 +152,7 @@ def calculate_lot_size(symbol: str, leverage: int) -> float:
     2. 用最近一根 K 线收盘价当作“标记价”近似
     3. 公式：lot_count = floor(available_usdt * leverage / mark_price)
     """
-    balances = client.get_wallet_balance(coin="USDT")
+    balances = client_v5.get_wallet_balance(coin="USDT")
     if "result" not in balances or "USDT" not in balances["result"]:
         raise RuntimeError(f"get_wallet_balance 返回异常: {balances}")
     available_usdt = float(balances["result"]["USDT"]["available_balance"])
@@ -244,7 +246,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
         print(f"[{pd.Timestamp.now()}] 买入条件满足，准备下多单。")
         size = calculate_lot_size(SYMBOL, leverage=3)
         print(f"[{pd.Timestamp.now()}] → 下单信息：杠杆×3，合约数={size:.3f}, 价格≈{last_close:.6f}")
-        resp = client.place_active_order(
+        resp = client_v5.place_active_order(
             symbol           = SYMBOL,
             side             = "Buy",
             order_type       = "Market",
@@ -270,7 +272,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
         # (A) 如果盈利 ≥ 1.5% → 平仓
         if profit_pct >= 1.5:
             print(f"[{pd.Timestamp.now()}] 盈利 ≥ 1.5%，市价平仓 Sell。")
-            resp = client.place_active_order(
+            resp = client_v5.place_active_order(
                 symbol           = SYMBOL,
                 side             = "Sell",
                 order_type       = "Market",
@@ -289,7 +291,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
             held_minutes = (pd.to_datetime(last_idx) - pd.to_datetime(entry_time)).total_seconds() / 60
             if held_minutes >= 4320 and abs(last_close - entry_price) < 1e-8:
                 print(f"[{pd.Timestamp.now()}] 持仓 {held_minutes/60:.1f} 小时 (>72 小时) 且回本 → 平仓。")
-                resp = client.place_active_order(
+                resp = client_v5.place_active_order(
                     symbol           = SYMBOL,
                     side             = "Sell",
                     order_type       = "Market",
@@ -322,8 +324,13 @@ def main():
     # 如果 TEST_ORDER=True，就直接测试下单 5 合约，然后结束脚本
     if TEST_ORDER:
         print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)。")
+        # 使用 v2 客户端下单
+        from pybit import HTTP as BybitV2HTTP
+        client_v2 = BybitV2HTTP("https://api.bybit.com",
+                                api_key    = BYBIT_API_KEY,
+                                api_secret = BYBIT_API_SECRET)
         try:
-            resp = client.place_active_order(
+            resp = client_v2.place_active_order(
                 symbol           = SYMBOL,
                 side             = "Buy",
                 order_type       = "Market",
@@ -335,10 +342,9 @@ def main():
             print(f"[{pd.Timestamp.now()}] 测试下单 5 合约响应：{resp}")
         except Exception as e:
             print(f"[{pd.Timestamp.now()}] 测试下单过程中出错：{e}")
-        # TEST_ORDER 后不做策略逻辑，直接返回
-        return
+        return  # 结束脚本
 
-    # 若非测试模式，则走策略逻辑（CryptoCompare + 指标 + 自动下单）
+    # 非测试模式 → 正常策略逻辑
     try:
         df = fetch_klines(SYMBOL, limit=FETCH_LIMIT)
         new_state = strategy_logic(df, state)
