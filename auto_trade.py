@@ -8,6 +8,7 @@ import numpy as np
 
 from pybit.unified_trading import HTTP as BybitV5HTTP
 from pybit.exceptions import FailedRequestError
+from pybit import usdt_perpetual   # v2 客户端，用于 TEST_ORDER 下单
 
 # ----------------------------
 # 1. 从环境变量读取 Bybit API Key/Secret
@@ -23,8 +24,7 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 TEST_ORDER = os.getenv("TEST_ORDER", "false").lower() == "true"
 
 # ----------------------------
-# 2. 用新版 Pybit v5 建立 HTTP 客户端 (USDT 永续合约)
-#    如果要跑 Testnet，把 testnet=True
+# 2. v5 客户端：用于策略模式下的拉 K 线 & 下单（如果不被 IP 限制）
 # ----------------------------
 client_v5 = BybitV5HTTP(
     testnet=False,
@@ -33,24 +33,42 @@ client_v5 = BybitV5HTTP(
 )
 
 # ----------------------------
-# 2.1 如果不是 TEST_ORDER，就尝试设置杠杆为 3 倍；
-#     如果是 TEST_ORDER，也要先设置杠杆为 3 倍再下单
+# 2.1 v2 客户端：仅用于 TEST_ORDER 下单
 # ----------------------------
-def ensure_leverage():
+# v2 HTTP endpoint 指向正式网
+client_v2 = usdt_perpetual.HTTP(
+    endpoint   = "https://api.bybit.com",
+    api_key    = BYBIT_API_KEY,
+    api_secret = BYBIT_API_SECRET
+)
+
+# ----------------------------
+# 3. 先设杠杆 3 倍（v2 或 v5 随机走，若被限流打印警告）
+# ----------------------------
+def ensure_leverage_v2():
+    try:
+        # v2 set_leverage 需要同时指定 Buy/Sell
+        client_v2.set_leverage(symbol="ADAUSDT", buy_leverage=3, sell_leverage=3)
+        print(f"[{pd.Timestamp.now()}] v2 杠杆设置成功：ADAUSDT = 3 倍")
+    except Exception as e:
+        print(f"[{pd.Timestamp.now()}] Warning(v2): 设置杠杆时出错，已跳过。错误信息：{e}")
+
+def ensure_leverage_v5():
     try:
         client_v5.set_leverage(symbol="ADAUSDT", leverage=3)
-        print(f"[{pd.Timestamp.now()}] 杠杆设置成功：ADAUSDT = 3 倍")
+        print(f"[{pd.Timestamp.now()}] v5 杠杆设置成功：ADAUSDT = 3 倍")
     except FailedRequestError as e:
-        print(f"[{pd.Timestamp.now()}] Warning: 设置杠杆时发生错误，已跳过。错误信息：{e}")
+        print(f"[{pd.Timestamp.now()}] Warning(v5): 设置杠杆时发生错误，已跳过。错误信息：{e}")
 
 if TEST_ORDER:
-    print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式开启，准备先设置杠杆 3 倍再下单。")
-    ensure_leverage()
+    print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式开启，先调用 v2 设置杠杆 3 倍。")
+    ensure_leverage_v2()
 else:
-    ensure_leverage()
+    print(f"[{pd.Timestamp.now()}] 普通模式，先调用 v5 设置杠杆 3 倍。")
+    ensure_leverage_v5()
 
 # ----------------------------
-# 3. 参数设置
+# 4. 参数设置
 # ----------------------------
 SYMBOL      = "ADAUSDT"   # 交易对：ADA/USDT 永续合约（用于下单）
 FETCH_LIMIT = 200         # 拉取最近 200 根 1 小时 K 线
@@ -64,7 +82,7 @@ BB_LENGTH   = 20
 BB_MULT     = 2.0
 
 # ----------------------------
-# 4. 持仓状态保存 (state.json)
+# 5. 持仓状态保存 (state.json)
 # ----------------------------
 STATE_FILENAME = "state.json"
 
@@ -80,7 +98,7 @@ def save_state(state):
         json.dump(state, f)
 
 # ----------------------------
-# 5. 拉 K 线并转换成 pandas.DataFrame（使用 CryptoCompare 公共接口）
+# 6. 拉 K 线并转换成 pandas.DataFrame（使用 CryptoCompare 公共接口）
 #    并转换成台湾本地时间 (Asia/Taipei)
 # ----------------------------
 def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
@@ -125,7 +143,7 @@ def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
     ohlc_list = data["Data"]["Data"]
     df = pd.DataFrame(ohlc_list)
 
-    # 首先把 "time"（Unix 秒）转成 UTC 时区的 Timestamp
+    # 把 "time"（Unix 秒）转成 UTC 时区的 Timestamp
     df["open_time"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
     # 再把它从 UTC 转到 Asia/Taipei
@@ -148,11 +166,11 @@ def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
     return df2
 
 # ----------------------------
-# 6. 计算可用余额并返回可下单合约数
+# 7. 计算可用余额并返回可下单合约数
 # ----------------------------
 def calculate_lot_size(symbol: str, leverage: int) -> float:
     """
-    1. 从 Bybit Wallet Balance API 拿到可用 USDT
+    1. 从 Bybit Wallet Balance API 拿到可用 USDT (v5)
     2. 用最近一根 K 线收盘价当作“标记价”近似
     3. 公式：lot_count = floor(available_usdt * leverage / mark_price)
     """
@@ -174,7 +192,7 @@ def calculate_lot_size(symbol: str, leverage: int) -> float:
     return size
 
 # ----------------------------
-# 7. 用 pandas + numpy 手动计算 Stochastic & Bollinger Bands
+# 8. 用 pandas + numpy 手动计算 Stochastic & Bollinger Bands
 # ----------------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -199,7 +217,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df_
 
 # ----------------------------
-# 8. 核心策略逻辑：判断买入/卖出、控制持仓
+# 9. 核心策略逻辑：判断买入/卖出、控制持仓
 #    增加打印最后几行指标 & 信号打印
 # ----------------------------
 def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
@@ -232,7 +250,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
     print(f"[{pd.Timestamp.now()}] 最后一根 K 线时间 (台北时区): {last_idx}, 收盘价: {last_close:.6f}, 低: {last_low:.6f}, 成交量: {last_vol:.2f}")
     print(f"[{pd.Timestamp.now()}] %J 前:{prev_j:.2f}，当前:{curr_j:.2f}，BB 下轨: {lower_band:.6f}")
 
-    # 8.1 原始买入条件：%J ≤ 15 且 跌破 BB 下轨、成交量放大、%J 向上、当根量 > 20M
+    # 9.1 原始买入条件：%J ≤ 15 且 跌破 BB 下轨、成交量放大、%J 向上、当根量 > 20M
     cond_j_low       = curr_j <= 15
     cond_broken_bb   = last_low < lower_band
     cond_vol_up      = last_vol > prev_vol
@@ -240,12 +258,12 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
     cond_vol_over20m = last_vol > 20_000_000
     buy_cond         = cond_j_low and cond_broken_bb and cond_vol_up and cond_j_rising and cond_vol_over20m
 
-    # 8.2 或当根 K 线跌幅 ≥ 7%，也算买入
+    # 9.2 或当根 K 线跌幅 ≥ 7%，也算买入
     bar_drop = ((last_open - last_close) / last_open * 100) >= 7
     final_buy_cond = buy_cond or bar_drop
 
     size = None
-    # 8.3 如果当前没持仓且满足买入条件 → 全仓 3 倍杠杆下多单
+    # 9.3 如果当前没持仓且满足买入条件 → 全仓 3 倍杠杆下多单
     if (not in_position) and final_buy_cond:
         print(f"[{pd.Timestamp.now()}] 买入条件满足，准备下多单。")
         size = calculate_lot_size(SYMBOL, leverage=3)
@@ -264,7 +282,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
         entry_price = last_close
         entry_time  = last_idx.strftime("%Y-%m-%d %H:%M:%S")
 
-    # 8.4 如果已经持仓，检查平仓条件
+    # 9.4 如果已经持仓，则检查平仓条件
     elif in_position:
         print(f"[{pd.Timestamp.now()}] 当前已有持仓，检查平仓条件。")
         if size is None:
@@ -309,7 +327,7 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
                 entry_price = None
                 entry_time  = None
 
-    # 8.5 更新并返回最新持仓状态
+    # 9.5 更新并返回最新持仓状态
     new_state = {
         "in_position": in_position,
         "entry_price": entry_price,
@@ -318,18 +336,18 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
     return new_state
 
 # ----------------------------
-# 9. 主程序：拉 K 线 → 或直接测试下单 → 执行策略 → 下单 → 更新 state.json
-#    增加调试打印 & TEST_ORDER 下单 5 合约（3 倍杠杆）
+# 10. 主程序：拉 K 线 → 或直接测试下单 → 执行策略 → 下单 → 更新 state.json
+#     增加调试打印 & TEST_ORDER 下单 5 合约（3 倍杠杆）
 # ----------------------------
 def main():
     state = load_state()
     print(f"[{pd.Timestamp.now()}] 当前持仓状态: {state}")
 
-    # 如果 TEST_ORDER=True，就直接测试下单 5 合约，然后结束脚本
+    # 如果 TEST_ORDER=True，就直接用 v2 客户端市价买入 5 合约，然后结束脚本
     if TEST_ORDER:
-        print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)，已设杠杆 3 倍。")
+        print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)，已设杠杆 3 倍（v2）。")
         try:
-            resp = client_v5.place_active_order(
+            resp = client_v2.place_active_order(
                 symbol           = SYMBOL,
                 side             = "Buy",
                 order_type       = "Market",
