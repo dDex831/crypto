@@ -69,17 +69,17 @@ def save_state(state):
         json.dump(state, f)
 
 # ----------------------------
-# 5. 拉 K 线并转换成 pandas.DataFrame（使用 Bybit 公共接口）
-#    增加了对 HTTP 状态码的检查与更详细的错误提示。
+# 5. 拉 K 线并转换成 pandas.DataFrame（使用 Bybit v2 公共接口）
+#    v2 endpoint: https://api.bybit.com/public/linear/kline
 # ----------------------------
 def fetch_klines(symbol, interval, limit=200):
     """
-    直接调用 Bybit v5 公共 K-line 接口，不带 API Key（避免 IP 被限制）。
+    直接调用 Bybit v2 公共 K-line 接口，不带 API Key（避开 v5 被 CloudFront 阻挡）。
     返回 pandas.DataFrame:
       index: open_time (pd.Timestamp)
       columns: open, high, low, close, volume
     """
-    url = "https://api.bybit.com/v5/market/kline"
+    url = "https://api.bybit.com/public/linear/kline"
     params = {
         "symbol": symbol,
         "interval": interval,
@@ -89,36 +89,49 @@ def fetch_klines(symbol, interval, limit=200):
     try:
         r = requests.get(url, params=params, timeout=10)
     except Exception as e:
-        # 网络层面请求失败（超时、DNS 无法解析等）
-        raise RuntimeError(f"调用 Bybit 公共 K-line 接口时网络错误: {e}")
+        raise RuntimeError(f"调用 Bybit v2 公共 K-line 接口时网络错误: {e}")
 
-    # 先检查 HTTP 状态码
+    # 检查 HTTP 状态码
     if r.status_code != 200:
-        # 如果状态码不是 200，就把状态码和响应文本都打印出来
-        raise RuntimeError(f"Bybit 公共 K-line HTTP 错误: Status {r.status_code}, Response: {r.text}")
+        raise RuntimeError(f"Bybit v2 公共 K-line HTTP 错误: Status {r.status_code}, Response: {r.text}")
 
     # 尝试解析 JSON
     try:
         resp = r.json()
     except Exception as e:
-        # 返回内容不是合法 JSON
-        raise RuntimeError(f"Bybit 公共 K-line 返回无法解析为 JSON: {e} | Raw Response: {r.text}")
+        raise RuntimeError(f"Bybit v2 公共 K-line 返回无法解析为 JSON: {e} | Raw Response: {r.text}")
 
-    # 检查 retCode 和 result.list 是否存在
-    if resp.get("retCode") != 0 or "result" not in resp or "list" not in resp["result"]:
-        raise RuntimeError(f"Bybit 公共 K-line 返回格式异常: {resp}")
+    # Bybit v2 返回示例:
+    # {
+    #   "ret_code": 0,
+    #   "ret_msg": "OK",
+    #   "ext_code": "",
+    #   "ext_info": "",
+    #   "result": [
+    #       {
+    #         "open_time": 1690000000,
+    #         "open": "0.5000",
+    #         "high": "0.5100",
+    #         "low": "0.4950",
+    #         "close": "0.5050",
+    #         "volume": "12345.67"
+    #       },
+    #       ...
+    #   ],
+    #   "time_now": "1690001234.567890"
+    # }
+    if resp.get("ret_code") != 0 or "result" not in resp or not isinstance(resp["result"], list):
+        raise RuntimeError(f"Bybit v2 公共 K-line 返回格式异常: {resp}")
 
-    raw_list = resp["result"]["list"]
-    # raw_list 中每一项格式：[open_time(ms), open, high, low, close, volume, turnover]
-    df = pd.DataFrame(raw_list, columns=[
-        "open_time", "open", "high", "low", "close", "volume", "turnover"
-    ])
+    data_list = resp["result"]
+    df = pd.DataFrame(data_list)
 
-    # 转换 open_time → pandas Timestamp，并设为 index
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    # 将 open_time（秒）转换为毫秒，然后转为 pandas Timestamp
+    # v2 返回的 open_time 单位为秒 (e.g. 1690000000)，要乘以1000
+    df["open_time"] = pd.to_datetime(df["open_time"] * 1000, unit="ms")
     df = df.set_index("open_time")
 
-    # 只保留我们需要的列，并转换为 float
+    # 转换数值列为 float
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
 
