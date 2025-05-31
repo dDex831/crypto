@@ -1,3 +1,5 @@
+# auto_trade.py
+
 import os
 import json
 import requests
@@ -15,6 +17,9 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 if not BYBIT_API_KEY or not BYBIT_API_SECRET:
     raise ValueError("请先在环境变量设定 BYBIT_API_KEY 和 BYBIT_API_SECRET")
 
+# 是否启用“测试下单模式”：直接下市价单 5 合约
+TEST_ORDER = os.getenv("TEST_ORDER", "false").lower() == "true"
+
 # ----------------------------
 # 2. 用新版 Pybit v5 建立 HTTP 客户端 (USDT 永续合约)
 #    如果要跑 Testnet，把 testnet=True
@@ -25,12 +30,18 @@ client = HTTP(
     api_secret = BYBIT_API_SECRET
 )
 
+# ----------------------------
 # 2.1 尝试设置杠杆为 3 倍，如果出错（IP 限制、API 权限等），捕获异常并继续
-try:
-    client.set_leverage(symbol="ADAUSDT", leverage=3)
-    print(f"[{pd.Timestamp.now()}] 杠杆设置成功：ADAUSDT = 3 倍")
-except FailedRequestError as e:
-    print(f"[{pd.Timestamp.now()}] Warning: 设置杠杆时发生错误，已跳过。错误信息：{e}")
+# ----------------------------
+# 如果只是想测试下单 5 合约，这里可以不一定要设置杠杆，但为了演示保留如下代码
+if not TEST_ORDER:
+    try:
+        client.set_leverage(symbol="ADAUSDT", leverage=3)
+        print(f"[{pd.Timestamp.now()}] 杠杆设置成功：ADAUSDT = 3 倍")
+    except FailedRequestError as e:
+        print(f"[{pd.Timestamp.now()}] Warning: 设置杠杆时发生错误，已跳过。错误信息：{e}")
+else:
+    print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式开启，跳过杠杆设置。")
 
 # ----------------------------
 # 3. 参数设置
@@ -74,10 +85,9 @@ def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
       index: open_time (pd.Timestamp with tz='Asia/Taipei')
       columns: open, high, low, close, volume
     参数：
-      symbol: "ADAUSDT"  -> 我们会把它拆成 fsym="ADA" 和 tsym="USDT"
+      symbol: "ADAUSDT"  -> 拆成 fsym="ADA" 和 tsym="USDT"
       limit: 最多返回几根历史 K 线，最大200
     """
-    # 拆成 fsym, tsym
     fsym = symbol[:-4]   # "ADAUSDT" -> "ADA"
     tsym = symbol[-4:]   # "ADAUSDT" -> "USDT"
 
@@ -302,27 +312,43 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
     return new_state
 
 # ----------------------------
-# 9. 主程序：拉 K 线 → 执行策略 → 下单 → 更新 state.json
-#    增加调试打印
+# 9. 主程序：拉 K 线 → 或直接测试下单 → 执行策略 → 下单 → 更新 state.json
+#    增加调试打印 & TEST_ORDER 下单 5 合约
 # ----------------------------
 def main():
     state = load_state()
     print(f"[{pd.Timestamp.now()}] 当前持仓状态: {state}")
-    try:
-        # 1) 拉取 K 线
-        df = fetch_klines(SYMBOL, limit=FETCH_LIMIT)
 
-        # 2) 运行策略逻辑并打印持仓状态变化
+    # 如果 TEST_ORDER=True，就直接测试下单 5 合约，然后结束脚本
+    if TEST_ORDER:
+        print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)。")
+        try:
+            resp = client.place_active_order(
+                symbol           = SYMBOL,
+                side             = "Buy",
+                order_type       = "Market",
+                qty              = 5,                # 固定下 5 合约
+                time_in_force    = "GoodTillCancel",
+                reduce_only      = False,
+                close_on_trigger = False
+            )
+            print(f"[{pd.Timestamp.now()}] 测试下单 5 合约响应：{resp}")
+        except Exception as e:
+            print(f"[{pd.Timestamp.now()}] 测试下单过程中出错：{e}")
+        # TEST_ORDER 后不做策略逻辑，直接返回
+        return
+
+    # 若非测试模式，则走策略逻辑（CryptoCompare + 指标 + 自动下单）
+    try:
+        df = fetch_klines(SYMBOL, limit=FETCH_LIMIT)
         new_state = strategy_logic(df, state)
         if new_state != state:
             print(f"[{pd.Timestamp.now()}] ⚡ 持仓状态改变: {state} → {new_state}，保存状态。")
             save_state(new_state)
         else:
             print(f"[{pd.Timestamp.now()}] 持仓状态无变化: {state}")
-
     except Exception as e:
         print(f"[{pd.Timestamp.now()}] 执行过程中出错：{e}")
-        # 抛出异常让 GitHub Actions 返回非零退出码
         raise
 
 if __name__ == "__main__":
