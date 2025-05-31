@@ -2,6 +2,7 @@
 
 import os
 import json
+import requests
 import pandas as pd
 import numpy as np
 
@@ -68,28 +69,57 @@ def save_state(state):
         json.dump(state, f)
 
 # ----------------------------
-# 5. 拉 K 线并转换成 pandas.DataFrame
+# 5. 拉 K 线并转换成 pandas.DataFrame（使用 Bybit 公共接口）
 # ----------------------------
 def fetch_klines(symbol, interval, limit=200):
     """
-    Bybit Unified Trading REST API query_kline → 返回 DataFrame:
+    直接调用 Bybit v5 公共 K-line 接口，不带 API Key（避免 IP 被限制）。
+    返回 pandas.DataFrame:
       index: open_time (pd.Timestamp)
       columns: open, high, low, close, volume
     """
-    resp = client.get_kline(
-        symbol   = symbol,
-        interval = interval,
-        limit    = limit,
-        _unified = True
-    )
-    if "result" not in resp or not isinstance(resp["result"], list):
-        raise RuntimeError(f"query_kline 返回异常: {resp}")
-    data = resp["result"]
-    df = pd.DataFrame(data)
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        resp = r.json()
+    except Exception as e:
+        raise RuntimeError(f"调用 Bybit 公共 K-line 失败: {e}")
+
+    # Bybit v5 公共 K-line 返回示例:
+    # {
+    #   "retCode": 0,
+    #   "retMsg": "OK",
+    #   "result": {
+    #       "list": [
+    #           [<open_time(ms)>, <open>, <high>, <low>, <close>, <volume>, <turnover>],
+    #           ...
+    #       ],
+    #       "category": "linear_perpetual"
+    #   },
+    #   "time": 1690000000000
+    # }
+    if resp.get("retCode") != 0 or "result" not in resp or "list" not in resp["result"]:
+        raise RuntimeError(f"Bybit 公共 K-line 返回格式异常: {resp}")
+
+    raw_list = resp["result"]["list"]
+    df = pd.DataFrame(raw_list, columns=[
+        "open_time", "open", "high", "low", "close", "volume", "turnover"
+    ])
+
+    # 转换 open_time → pandas Timestamp，并设为 index
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     df = df.set_index("open_time")
+
+    # 只保留需要的列，并转换为 float
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = df[col].astype(float)
+
     return df
 
 # ----------------------------
