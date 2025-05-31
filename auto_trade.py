@@ -6,7 +6,8 @@ import requests
 import pandas as pd
 import numpy as np
 
-from pybit import HTTP as BybitV2HTTP  # 使用 v2 客户端
+from pybit.unified_trading import HTTP as BybitV5HTTP
+from pybit.exceptions import FailedRequestError
 
 # ----------------------------
 # 1. 从环境变量读取 Bybit API Key/Secret
@@ -22,24 +23,23 @@ if not BYBIT_API_KEY or not BYBIT_API_SECRET:
 TEST_ORDER = os.getenv("TEST_ORDER", "false").lower() == "true"
 
 # ----------------------------
-# 2. 用 pybit v2 建立 HTTP 客户端 (USDT 永续合约)
-#    endpoint 指向正式网
+# 2. 用 pybit v5 建立 HTTP 客户端 (USDT 永续合约)
+#    如果要跑 Testnet，把 testnet=True
 # ----------------------------
-client = BybitV2HTTP(
-    endpoint   = "https://api.bybit.com",
+client = BybitV5HTTP(
+    testnet=False,
     api_key    = BYBIT_API_KEY,
     api_secret = BYBIT_API_SECRET
 )
 
 # ----------------------------
 # 3. 先设杠杆 3 倍
-#    v2 set_leverage 需要 buy_leverage 和 sell_leverage
 # ----------------------------
 def ensure_leverage():
     try:
-        client.set_leverage(symbol="ADAUSDT", buy_leverage=3, sell_leverage=3)
+        client.set_leverage(symbol="ADAUSDT", leverage=3)
         print(f"[{pd.Timestamp.now()}] 杠杆设置成功：ADAUSDT = 3 倍")
-    except Exception as e:
+    except FailedRequestError as e:
         print(f"[{pd.Timestamp.now()}] Warning: 设置杠杆时发生错误，已跳过。错误信息：{e}")
 
 print(f"[{pd.Timestamp.now()}] 初始化：即将设置杠杆 3 倍。")
@@ -146,7 +146,7 @@ def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
 # ----------------------------
 def calculate_lot_size(symbol: str, leverage: int) -> float:
     """
-    1. 从 Bybit v2 Wallet Balance API 拿到可用 USDT
+    1. 从 Bybit v5 Wallet Balance API 拿到可用 USDT
     2. 用最近一根 K 线收盘价当作“标记价”近似
     3. 公式：lot_count = floor(available_usdt * leverage / mark_price)
     """
@@ -244,14 +244,12 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
         print(f"[{pd.Timestamp.now()}] 买入条件满足，准备下多单。")
         size = calculate_lot_size(SYMBOL, leverage=3)
         print(f"[{pd.Timestamp.now()}] → 下单信息：杠杆×3，合约数={size:.3f}, 价格≈{last_close:.6f}")
-        resp = client.place_active_order(
-            symbol           = SYMBOL,
-            side             = "Buy",
-            order_type       = "Market",
-            qty              = size,
-            time_in_force    = "GoodTillCancel",
-            reduce_only      = False,
-            close_on_trigger = False
+        resp = client.place_order(
+            category  = "linear",
+            symbol    = SYMBOL,
+            side      = "Buy",
+            orderType = "Market",
+            qty       = size
         )
         print(f"[{pd.Timestamp.now()}] 多单下单响应：{resp}")
         in_position = True
@@ -270,14 +268,12 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
         # (A) 如果盈利 ≥ 1.5% → 平仓
         if profit_pct >= 1.5:
             print(f"[{pd.Timestamp.now()}] 盈利 ≥ 1.5%，市价平仓 Sell。")
-            resp = client.place_active_order(
-                symbol           = SYMBOL,
-                side             = "Sell",
-                order_type       = "Market",
-                qty              = size,
-                time_in_force    = "GoodTillCancel",
-                reduce_only      = False,
-                close_on_trigger = False
+            resp = client.place_order(
+                category  = "linear",
+                symbol    = SYMBOL,
+                side      = "Sell",
+                orderType = "Market",
+                qty       = size
             )
             print(f"[{pd.Timestamp.now()}] 空单平仓响应：{resp}")
             in_position = False
@@ -289,14 +285,12 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
             held_minutes = (pd.to_datetime(last_idx) - pd.to_datetime(entry_time)).total_seconds() / 60
             if held_minutes >= 4320 and abs(last_close - entry_price) < 1e-8:
                 print(f"[{pd.Timestamp.now()}] 持仓 {held_minutes/60:.1f} 小时 (>72 小时) 且回本 → 平仓。")
-                resp = client.place_active_order(
-                    symbol           = SYMBOL,
-                    side             = "Sell",
-                    order_type       = "Market",
-                    qty              = size,
-                    time_in_force    = "GoodTillCancel",
-                    reduce_only      = False,
-                    close_on_trigger = False
+                resp = client.place_order(
+                    category  = "linear",
+                    symbol    = SYMBOL,
+                    side      = "Sell",
+                    orderType = "Market",
+                    qty       = size
                 )
                 print(f"[{pd.Timestamp.now()}] 3 天回本平仓响应：{resp}")
                 in_position = False
@@ -313,7 +307,6 @@ def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
 
 # ----------------------------
 # 10. 主程序：拉 K 线 → 或直接测试下单 → 执行策略 → 下单 → 更新 state.json
-#     增加调试打印 & TEST_ORDER 下单 5 合约（3 倍杠杆）
 # ----------------------------
 def main():
     state = load_state()
@@ -323,14 +316,12 @@ def main():
     if TEST_ORDER:
         print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)，已设杠杆 3 倍。")
         try:
-            resp = client.place_active_order(
-                symbol           = SYMBOL,
-                side             = "Buy",
-                order_type       = "Market",
-                qty              = 5,               # 固定下 5 合约
-                time_in_force    = "GoodTillCancel",
-                reduce_only      = False,
-                close_on_trigger = False
+            resp = client.place_order(
+                category  = "linear",
+                symbol    = SYMBOL,
+                side      = "Buy",
+                orderType = "Market",
+                qty       = "5"
             )
             print(f"[{pd.Timestamp.now()}] 测试下单 5 合约响应：{resp}")
         except Exception as e:
