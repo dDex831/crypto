@@ -37,8 +37,7 @@ except FailedRequestError as e:
 # ----------------------------
 # 3. 参数设置
 # ----------------------------
-SYMBOL      = "ADAUSDT"   # 交易对：ADA/USDT 永续合约
-TIMEFRAME   = "1h"        # Binance 1 小时 K 线标记为 "1h"
+SYMBOL      = "ADAUSDT"   # 交易对：ADA/USDT 永续合约（用于下单）
 FETCH_LIMIT = 200         # 拉取最近 200 根 1 小时 K 线
 
 # 下单时要动态计算 “可用余额 × 杠杆 ÷ 标记价” 得出合约数
@@ -69,81 +68,97 @@ def save_state(state):
         json.dump(state, f)
 
 # ----------------------------
-# 5. 拉 K 线并转换成 pandas.DataFrame（改用 Binance 公共接口）
+# 5. 拉 K 线并转换成 pandas.DataFrame（使用 CryptoCompare 公共接口）
 # ----------------------------
-def fetch_klines_binance(symbol, interval, limit=200):
+def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
     """
-    通过 Binance 公共 REST API 获取 K 线，不带 API Key。
-    symbol: 像 "ADAUSDT"
-    interval: 像 "1h"、"4h"、"1d" 等，这里我们用 "1h"
-    limit: 最多获取多少根 K 线
+    通过 CryptoCompare 公共 REST API 获取 ADA/USDT 小时 K 线，不带 API Key。
     返回 pandas.DataFrame:
       index: open_time (pd.Timestamp)
       columns: open, high, low, close, volume
+    参数：
+      symbol: "ADAUSDT"  -> 我们会把它拆成 fsym="ADA" 和 tsym="USDT"
+      limit: 最多返回几根历史 K 线，最大200
     """
-    url = "https://api.binance.com/api/v3/klines"
+    # 拆成 fsym, tsym
+    fsym = symbol[:-4]   # "ADAUSDT" -> "ADA"
+    tsym = symbol[-4:]   # "ADAUSDT" -> "USDT"
+
+    url = "https://min-api.cryptocompare.com/data/v2/histohour"
     params = {
-        "symbol": symbol,
-        "interval": interval,
+        "fsym": fsym,
+        "tsym": tsym,
         "limit": limit
     }
 
     try:
         r = requests.get(url, params=params, timeout=10)
     except Exception as e:
-        raise RuntimeError(f"调用 Binance K-line 接口时网络错误: {e}")
+        raise RuntimeError(f"调用 CryptoCompare K-line 接口时网络错误: {e}")
 
     if r.status_code != 200:
-        raise RuntimeError(f"Binance K-line HTTP 错误: Status {r.status_code}, Response: {r.text}")
+        raise RuntimeError(f"CryptoCompare K-line HTTP 错误: Status {r.status_code}, Response: {r.text}")
 
     try:
         data = r.json()
     except Exception as e:
-        raise RuntimeError(f"Binance K-line 返回无法解析为 JSON: {e} | Raw Response: {r.text}")
+        raise RuntimeError(f"CryptoCompare K-line 返回无法解析为 JSON: {e} | Raw Response: {r.text}")
 
-    # Binance 返回格式: 每一条 K 线是一个 list，内容为:
-    # [
-    #   0: openTime (毫秒),
-    #   1: open,
-    #   2: high,
-    #   3: low,
-    #   4: close,
-    #   5: volume,
-    #   6: closeTime,
-    #   7: quoteAssetVolume,
-    #   8: numberOfTrades,
-    #   9: takerBuyBaseAssetVolume,
-    #   10: takerBuyQuoteAssetVolume,
-    #   11: ignore
-    # ]
-    # 我们只取前 6 列。
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quoteAssetVolume", "numTrades",
-        "takerBuyBase", "takerBuyQuote", "ignore"
-    ])
+    # 返回格式示例:
+    # {
+    #   "Response": "Success",
+    #   "Message": "",
+    #   "HasWarning": False,
+    #   "Type": 100,
+    #   "RateLimit": {},
+    #   "Data": {
+    #       "Aggregated": False,
+    #       "TimeFrom": 1690003200,
+    #       "TimeTo": 1690089600,
+    #       "Data": [
+    #           {
+    #             "time": 1690003200,
+    #             "high": 0.500,
+    #             "low": 0.480,
+    #             "open": 0.490,
+    #             "volumefrom": 12345.6,
+    #             "volumeto": 6000.0,
+    #             "close": 0.495
+    #           },
+    #           ...
+    #       ]
+    #   }
+    # }
+    if data.get("Response") != "Success" or "Data" not in data or "Data" not in data["Data"]:
+        raise RuntimeError(f"CryptoCompare K-line 数据格式异常: {data}")
 
-    # 把 open_time(ms) 转成 pandas 的 Timestamp
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    ohlc_list = data["Data"]["Data"]
+    df = pd.DataFrame(ohlc_list)
+
+    # 将 time（秒）转换成 pandas.Timestamp，并设为索引
+    df["open_time"] = pd.to_datetime(df["time"], unit="s")
     df = df.set_index("open_time")
 
-    # 转换数值类型
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
+    # 转成我们需要的列，并转换为 float
+    df2 = pd.DataFrame({
+        "open": df["open"].astype(float),
+        "high": df["high"].astype(float),
+        "low":  df["low"].astype(float),
+        "close": df["close"].astype(float),
+        # CryptoCompare 返回的 volume 可用 volumefrom（基准币数量），
+        # 或者用 volumeto（计价币数量）。这里直接用 volumefrom。
+        "volume": df["volumefrom"].astype(float)
+    }, index=df.index)
 
-    # 返回只包含我们关注的列
-    return df[["open", "high", "low", "close", "volume"]]
-
-# 把 fetch_klines_binance 简写成 fetch_klines
-fetch_klines = fetch_klines_binance
+    return df2
 
 # ----------------------------
 # 6. 计算可用余额并返回可下单合约数
 # ----------------------------
-def calculate_lot_size(symbol, leverage):
+def calculate_lot_size(symbol: str, leverage: int) -> float:
     """
-    1. 从钱包余额 API 拿到可用 USDT
-    2. 用最近一根 K 线收盘价当作“标记价”近似（从 Binance 拉的 K 线数据）
+    1. 从 Bybit Wallet Balance API 拿到可用 USDT
+    2. 用最近一根 K 线收盘价当作“标记价”近似（从 CryptoCompare 拉的 K 线数据）
     3. 公式：lot_count = floor(available_usdt * leverage / mark_price)
     """
     balances = client.get_wallet_balance(coin="USDT")
@@ -152,7 +167,7 @@ def calculate_lot_size(symbol, leverage):
     available_usdt = float(balances["result"]["USDT"]["available_balance"])
 
     # 拿最近 5 根 1h K 线，最后一根的 close 当作标记价
-    klines = fetch_klines(symbol, TIMEFRAME, limit=5)
+    klines = fetch_klines(symbol, limit=5)
     mark_price = klines["close"].iloc[-1]
 
     raw_size = (available_usdt * leverage) / mark_price
@@ -163,7 +178,7 @@ def calculate_lot_size(symbol, leverage):
 # ----------------------------
 # 7. 用 pandas + numpy 手动计算 Stochastic & Bollinger Bands
 # ----------------------------
-def compute_indicators(df):
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     输入 df：必须包含 open, high, low, close, volume
     输出 df：新增 stoch_k, stoch_d, stoch_j, bb_lower
@@ -194,7 +209,7 @@ def compute_indicators(df):
 # ----------------------------
 # 8. 核心策略逻辑：判断买入/卖出、控制持仓
 # ----------------------------
-def strategy_logic(df, state):
+def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
     in_position = state["in_position"]
     entry_price = state["entry_price"]
     entry_time  = state["entry_time"]
@@ -306,7 +321,7 @@ def strategy_logic(df, state):
 def main():
     state = load_state()
     try:
-        df = fetch_klines(SYMBOL, TIMEFRAME, limit=FETCH_LIMIT)
+        df = fetch_klines(SYMBOL, limit=FETCH_LIMIT)
         new_state = strategy_logic(df, state)
         if new_state != state:
             save_state(new_state)
