@@ -2,7 +2,6 @@ name: Bybit ADA/USDT Auto Trading Polling
 
 on:
   schedule:
-    # 每 3 分鐘執行一次
     - cron: '*/3 * * * *'
   workflow_dispatch:
 
@@ -14,7 +13,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Set up Python 3.9
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
