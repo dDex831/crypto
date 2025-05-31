@@ -1,8 +1,8 @@
-# .github/workflows/auto-trade.yml
 name: Bybit ADA/USDT Auto Trading Polling
 
 on:
   schedule:
+    # 每 3 分鐘執行一次
     - cron: '*/3 * * * *'
   workflow_dispatch:
 
@@ -14,7 +14,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Set up Python
+      - name: Set up Python 3.9
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
@@ -22,7 +22,6 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # 只需安裝 pandas 與 pybit (Pybit 會自動帶入適合的 numpy)
           pip install pandas pybit
 
       - name: Run auto_trade.py
