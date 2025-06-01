@@ -1,12 +1,9 @@
 name: "Auto Trade Bot"
 
 on:
-  # 每小时跑一次，也可以改成每 4 小时一次，例如：'0 */4 * * *'
-  schedule:
-    - cron: '0 * * * *'  
-
-  # 也可以手动触发
-  workflow_dispatch:
+    schedule:
+      - cron: "*/5 * * * *"   # 每 5 分钟执行一次（注意 GitHub 会按照 “最近的 5 分钟倍数” 来跑）
+    workflow_dispatch:
 
 jobs:
   run_auto_trade:
