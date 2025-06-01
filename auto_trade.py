@@ -34,9 +34,9 @@ def load_state():
     if not os.path.exists(STATE_FILE):
         return {
             "inPosition": False,     # 是否持仓
-            "entryTime": None,       # 持仓时的时间戳（UTC）
+            "entryTime": None,       # 持仓时的时间戳（UTC，ISO 格式）
             "entryPrice": None,      # 持仓时的实际成交均价
-            "entryQty": None         # 持仓时的实际成交数量
+            "entryQty": None         # 持仓时的实际成交数量（合约张数或现货币数）
         }
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -148,26 +148,26 @@ def check_signals(df: pd.DataFrame, state: dict):
 
     return None, None
 
-# ========== 7. 下单函数 ==========
+# ========== 7. 下单函数（针对永续合约） ==========
 def place_order(action: str, symbol: str, quantity: float):
     """
-    简化示例：默认使用市价单
     action: "BUY" 或 "SELL"
-    quantity: 买入/卖出数量
+    quantity: 合约下单张数（USDT-M 永续合约）
+    这里示例都用市价单，如果要改成限价或其他类型，请自行修改 type/price 参数。
     """
     try:
         if action == "BUY":
-            order = client.create_order(
+            order = client.futures_create_order(
                 symbol=symbol,
-                side=Client.SIDE_BUY,
-                type=Client.ORDER_TYPE_MARKET,
+                side="BUY",
+                type="MARKET",
                 quantity=quantity
             )
         else:  # SELL
-            order = client.create_order(
+            order = client.futures_create_order(
                 symbol=symbol,
-                side=Client.SIDE_SELL,
-                type=Client.ORDER_TYPE_MARKET,
+                side="SELL",
+                type="MARKET",
                 quantity=quantity
             )
         print(f"{datetime.now()} 下单成功：{action}, 订单 ID: {order['orderId']}")
@@ -176,22 +176,62 @@ def place_order(action: str, symbol: str, quantity: float):
         print(f"{datetime.now()} 下单失败：{e}")
         return None
 
-# ========== 8. 计算仓位数量（按 USDT 余额） ===========
+# ========== 8. 计算合约下单张数（按 USDT 余额） ===========
 def calc_quantity(usdt_amount: float, price: float):
     """
-    计算在当前价格下，用 usdt_amount（USDT）可以购买多少 ADA（现货或合约按市价）。向下取整保留精度到 0.001。
+    计算在当前价格下，用 usdt_amount（USDT）可以在永续合约买多少张 ADA。
+    先按比例算出数量，然后向下取整保留到 0.001 张。
     """
     step_size = 0.001
     qty = usdt_amount / price
     qty = math.floor(qty / step_size) * step_size
     return float(format(qty, f".3f"))
 
-# ========== 9. 主流程 ==========
+# ========== 9. 检查本地状态 vs. 永续合约真实持仓 ==========
+def sync_position_with_api(state: dict):
+    """
+    如果本地 state["inPosition"] == True，就去 Binance API 查询
+    永续合约仓位（futures position），如果发现该 symbol 在 币安合约
+    账户中 positionAmt == 0，则说明实际已无持仓，需把本地 state 清空。
+    """
+    if not state.get("inPosition", False):
+        # 本地没持仓，直接返回
+        return state
+
+    try:
+        # 下面 API: 获取该 symbol 在永续合约账户的持仓信息
+        positions = client.futures_position_information(symbol=SYMBOL)
+        # positions 是一个列表，每个元素里有 "positionAmt" 表示该仓位
+        # 取出 positionAmt
+        actual_amt = 0.0
+        for pos in positions:
+            # pos["symbol"] 里就应该是 "ADAUSDT"
+            if pos.get("symbol") == SYMBOL:
+                actual_amt = float(pos.get("positionAmt", 0))
+                break
+
+        if actual_amt == 0.0:
+            # 本地 state 标示 inPosition，但 API 读出来是 0 => 实际已爆仓或平仓
+            print(f"{datetime.now()} 检测到本地 inPosition=True，但合约仓位为 0 → 重置本地状态。")
+            state["inPosition"] = False
+            state["entryPrice"] = None
+            state["entryTime"] = None
+            state["entryQty"] = None
+            save_state(state)  # 直接把清空后的 state 持久化
+    except BinanceAPIException as e:
+        print(f"{datetime.now()} 同步仓位时出错：{e}")
+
+    return state
+
+# ========== 10. 主流程 ==========
 def main():
-    # 9.1 加载持仓状态
+    # 10.1 加载持仓状态
     state = load_state()
 
-    # 9.2 拉取数据、计算指标
+    # 10.2 同步本地 state 与币安永续合约真实持仓状态
+    state = sync_position_with_api(state)
+
+    # 10.3 拉取数据、计算指标
     df = fetch_klines(SYMBOL, INTERVAL, limit=LIMIT)
     df = compute_indicators(df)
 
@@ -206,26 +246,24 @@ def main():
     print("====================================\n")
     # —— 调试打印结束 —— #
 
-    # 9.3 判断信号
+    # 10.4 判断信号
     action, price = check_signals(df, state)
 
     if action == "BUY":
         usdt_amount = 200
-        # 9.3.1 计算买入数量
+        # 10.4.1 计算买入张数
         qty = calc_quantity(usdt_amount, price)
 
-        # 9.3.2 下买单
+        # 10.4.2 直接在永续合约下市价单买入
         order = place_order("BUY", SYMBOL, qty)
         if order:
             # 从 order["fills"] 中提取实际成交数量与加权均价
             fills = order.get("fills", [])
-            total_qty = sum(float(f["qty"]) for f in fills)
-            if total_qty > 0:
+            total_qty = sum(float(f["qty"]) for f in fills) if fills else qty
+            if fills:
                 avg_price = sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
             else:
-                # 万一 fills 为空，就退回 K 线收盘价作为备选
                 avg_price = price
-                total_qty = qty
 
             # 更新状态：记录 inPosition、entryPrice、entryQty 及 entryTime
             state["inPosition"] = True
@@ -238,21 +276,19 @@ def main():
             )
 
     elif action in ("SELL_TP", "SELL_3D"):
-        # 9.3.3 平仓：直接用保存的 entryQty
+        # 10.4.3 平仓：直接用保存的 entryQty
         qty = state.get("entryQty")
         if qty is None:
             print(f"{datetime.now()} 错误：找不到 entryQty，无法平仓")
         else:
             order = place_order("SELL", SYMBOL, qty)
             if order:
-                # 从 order["fills"] 中提取实际成交数量与加权均价
                 fills = order.get("fills", [])
-                total_qty = sum(float(f["qty"]) for f in fills)
-                if total_qty > 0:
+                total_qty = sum(float(f["qty"]) for f in fills) if fills else qty
+                if fills:
                     avg_price = sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
                 else:
                     avg_price = None
-                    total_qty = qty
 
                 print(f"{datetime.now()} 实际平仓价 {avg_price:.6f}，平仓数量 {total_qty:.3f}，动作 {action}")
                 # 清空状态
@@ -264,10 +300,10 @@ def main():
     else:
         print(f"{datetime.now()} 无操作信号。当前持仓状态：{state}")
 
-    # 9.4 把 state 写回文件
+    # 10.5 把 state 写回文件
     save_state(state)
 
-# ========== 10. 测试函数：市价单买入 20 ADA 合约 (3 倍杠杆)，3 秒后卖出 ==========
+# ========== 11. 测试函数：市价单买入 20 张 ADA 永续合约，3 秒后卖出 ==========
 def test_trade_futures():
     """
     在 USDT-M 永续合约账户上执行：
@@ -277,11 +313,11 @@ def test_trade_futures():
     4) 市价卖出 20 张（平仓）
     """
     try:
-        # 10.1 设置杠杆为 3 倍
+        # 11.1 设置杠杆为 3 倍
         leverage_resp = client.futures_change_leverage(symbol=SYMBOL, leverage=3)
         print(f"{datetime.now()} 杠杆设置响应：{leverage_resp}")
 
-        # 10.2 市价买入 20 张 ADAUSDT 永续合约
+        # 11.2 市价买入 20 张 ADAUSDT 永续合约
         buy_order = client.futures_create_order(
             symbol=SYMBOL,
             side="BUY",
@@ -290,10 +326,10 @@ def test_trade_futures():
         )
         print(f"{datetime.now()} 下单买入 20 张 ADA 合约，订单信息：{buy_order}")
 
-        # 10.3 等待 3 秒
+        # 11.3 等待 3 秒
         time.sleep(3)
 
-        # 10.4 市价卖出 20 张进行平仓
+        # 11.4 市价卖出 20 张进行平仓
         sell_order = client.futures_create_order(
             symbol=SYMBOL,
             side="SELL",
@@ -309,7 +345,6 @@ if __name__ == "__main__":
     # 运行主流程
     main()
 
-    # —— 执行测试下单 —— #
+    # —— 如果需要自己测试合约下单，可以取消下面两行注释 —— #
     # print("\n===== 开始测试：合约账户市价买入20 ADA，3 秒后卖出 =====")
     # test_trade_futures()
-    # print("===== 测试结束 =====\n")
