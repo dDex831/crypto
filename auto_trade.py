@@ -35,8 +35,8 @@ def load_state():
         return {
             "inPosition": False,     # 是否持仓
             "entryTime": None,       # 持仓时的时间戳（UTC）
-            "entryPrice": None,      # 持仓时的进场价格
-            "entryQty": None         # 持仓时的合约数量
+            "entryPrice": None,      # 持仓时的实际成交均价
+            "entryQty": None         # 持仓时的实际成交数量
         }
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -217,25 +217,44 @@ def main():
         # 9.3.2 下买单
         order = place_order("BUY", SYMBOL, qty)
         if order:
-            # 更新状态：记录 inPosition、entryPrice、entryTime 以及 entryQty
+            # 从 order["fills"] 中提取实际成交数量与加权均价
+            fills = order.get("fills", [])
+            total_qty = sum(float(f["qty"]) for f in fills)
+            if total_qty > 0:
+                avg_price = sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
+            else:
+                # 万一 fills 为空，就退回 K 线收盘价作为备选
+                avg_price = price
+                total_qty = qty
+
+            # 更新状态：记录 inPosition、entryPrice、entryQty 及 entryTime
             state["inPosition"] = True
-            state["entryPrice"] = price
-            state["entryQty"] = qty
+            state["entryPrice"] = avg_price
+            state["entryQty"] = total_qty
             last_time = df.iloc[-1]["open_time"]
             state["entryTime"] = last_time.replace(tzinfo=timezone.utc).isoformat()
             print(
-                f"{datetime.now()} 记录持仓状态：入场价格 {price}，入场数量 {qty}，时间 {state['entryTime']}"
+                f"{datetime.now()} 记录持仓状态：实际入场价 {avg_price:.6f}，入场数量 {total_qty:.3f}，时间 {state['entryTime']}"
             )
 
     elif action in ("SELL_TP", "SELL_3D"):
-        # 9.3.3 平仓：直接用保存的 entryQty，而不是重新计算
+        # 9.3.3 平仓：直接用保存的 entryQty
         qty = state.get("entryQty")
         if qty is None:
             print(f"{datetime.now()} 错误：找不到 entryQty，无法平仓")
         else:
             order = place_order("SELL", SYMBOL, qty)
             if order:
-                print(f"{datetime.now()} 执行平仓动作：{action}，卖出数量 {qty}")
+                # 从 order["fills"] 中提取实际成交数量与加权均价
+                fills = order.get("fills", [])
+                total_qty = sum(float(f["qty"]) for f in fills)
+                if total_qty > 0:
+                    avg_price = sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
+                else:
+                    avg_price = None
+                    total_qty = qty
+
+                print(f"{datetime.now()} 实际平仓价 {avg_price:.6f}，平仓数量 {total_qty:.3f}，动作 {action}")
                 # 清空状态
                 state["inPosition"] = False
                 state["entryPrice"] = None
@@ -248,18 +267,18 @@ def main():
     # 9.4 把 state 写回文件
     save_state(state)
 
-# ========== 10. 测试函数：市价单买入 20 ADA 合约 (5 倍杠杆)，3 秒后卖出 ==========
+# ========== 10. 测试函数：市价单买入 20 ADA 合约 (3 倍杠杆)，3 秒后卖出 ==========
 def test_trade_futures():
     """
     在 USDT-M 永续合约账户上执行：
-    1) 设置 ADAUSDT 永续合约杠杆为 5 倍
+    1) 设置 ADAUSDT 永续合约杠杆为 3 倍
     2) 市价买入 20 张 ADAUSDT 合约
     3) 等待 3 秒
     4) 市价卖出 20 张（平仓）
     """
     try:
-        # 10.1 设置杠杆为 5 倍
-        leverage_resp = client.futures_change_leverage(symbol=SYMBOL, leverage=5)
+        # 10.1 设置杠杆为 3 倍
+        leverage_resp = client.futures_change_leverage(symbol=SYMBOL, leverage=3)
         print(f"{datetime.now()} 杠杆设置响应：{leverage_resp}")
 
         # 10.2 市价买入 20 张 ADAUSDT 永续合约
@@ -267,7 +286,7 @@ def test_trade_futures():
             symbol=SYMBOL,
             side="BUY",
             type="MARKET",
-            quantity=20  # 这里改为买入 20 张合约
+            quantity=20
         )
         print(f"{datetime.now()} 下单买入 20 张 ADA 合约，订单信息：{buy_order}")
 
@@ -279,7 +298,7 @@ def test_trade_futures():
             symbol=SYMBOL,
             side="SELL",
             type="MARKET",
-            quantity=20  # 平仓时同样卖出 20 张
+            quantity=20
         )
         print(f"{datetime.now()} 下单卖出 20 张 ADA 合约，订单信息：{sell_order}")
 
