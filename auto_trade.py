@@ -281,6 +281,6 @@ if __name__ == "__main__":
     main()
 
     # —— 执行测试下单 —— #
-    print("\n===== 开始测试：合约账户市价买入5 ADA，3 秒后卖出 =====")
-    test_trade_futures()
-    print("===== 测试结束 =====\n")
+    # print("\n===== 开始测试：合约账户市价买入5 ADA，3 秒后卖出 =====")
+    # test_trade_futures()
+    # print("===== 测试结束 =====\n")
