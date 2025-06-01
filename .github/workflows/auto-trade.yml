@@ -1,10 +1,9 @@
-# 文件路径：.github/workflows/auto_trade.yml
 name: "Auto Trade Bot"
 
 on:
-  # 每小时跑一次，也可以改成每 4 小时一次：'0 */4 * * *'
+  # 每小时跑一次，也可以改成每 4 小时一次，例如：'0 */4 * * *'
   schedule:
-    - cron: '0 * * * *'  # 每整点执行一次
+    - cron: '0 * * * *'  
 
   # 也可以手动触发
   workflow_dispatch:
@@ -19,7 +18,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # 允许本 workflow 将修改后的状态文件 push 回仓库
+          # 允许本 workflow 将修改后的 state.json push 回仓库
           persist-credentials: true
           fetch-depth: 0
 
@@ -35,21 +34,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install python-binance pandas numpy
 
-      # 4. 运行脚本
+      # 4. （可选）列出仓库文件结构，方便调试
+      - name: List repository files  # 调试时可保留，确认脚本位置
+        run: |
+          ls -R .
+
+      # 5. 运行根目录下的 auto_trade.py
       - name: Run auto_trade.py
         env:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
         run: |
-          cd auto_trade
+          # 脚本位于仓库根目录，无需 cd 到 subfolder
           python auto_trade.py
 
-      # 5. 检查 state.json 是否有改动，如果有，就提交并推送
+      # 6. 检查并提交 state.json 是否有变更（假设 state.json 也在根目录）
       - name: Commit state changes
         run: |
-          cd auto_trade
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # 如果根目录下的 state.json 有变化，就提交并推送
           if [[ -n "$(git status --porcelain state.json)" ]]; then
             git add state.json
             git commit -m "Update state.json [skip ci]"
