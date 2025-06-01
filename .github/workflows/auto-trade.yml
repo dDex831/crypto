@@ -1,9 +1,9 @@
 name: "Auto Trade Bot"
 
 on:
-    schedule:
-      - cron: "*/5 * * * *"   # 每 5 分钟执行一次（注意 GitHub 会按照 “最近的 5 分钟倍数” 来跑）
-    workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"   # 每 5 分钟执行一次（注意 GitHub 会按照 “最近的 5 分钟倍数” 来跑）
+  workflow_dispatch:
 
 jobs:
   run_auto_trade:
@@ -32,7 +32,7 @@ jobs:
           pip install python-binance pandas numpy
 
       # 4. （可选）列出仓库文件结构，方便调试
-      - name: List repository files  # 调试时可保留，确认脚本位置
+      - name: List repository files
         run: |
           ls -R .
 
@@ -42,10 +42,9 @@ jobs:
           BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
           BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
         run: |
-          # 脚本位于仓库根目录，无需 cd 到 subfolder
           python auto_trade.py
 
-      # 6. 检查并提交 state.json 是否有变更（假设 state.json 也在根目录）
+      # 6. 检查并提交 state.json 是否有变更
       - name: Commit state changes
         run: |
           git config user.name "github-actions[bot]"
