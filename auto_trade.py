@@ -198,10 +198,21 @@ def main():
     df = fetch_klines(SYMBOL, INTERVAL, limit=LIMIT)
     df = compute_indicators(df)
 
-    # 为了判断 alert_on_next_bar，需要把前一根的 condition_flag 也带上
-    # 我们把 condition_flag 暂时存在 DataFrame 中，用于下次比较
-    # （实际流水线上，因为每次都重新拉取最新 100 根，DF 中没有 condition_flag，故本示例只在内存里做判断即可）
-    # 这里暂略 condition_flag 的传递，直接在代码里按 “prev” 判断
+    # —— 在这里插入调试打印，用来检查 K 线和指标数值 —— #
+    # 打印最近 5 根 4h K 线，以及它们的 open/high/low/close/volume
+    # 以及刚算出来的 k, d, j, lowerBB, redBarCount, barDrop, brokenBB, vol_increasing, vol_over_20m
+    print("\n===== 最近 5 根 4h K 线与指标 =====")
+    cols_to_show = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "k", "d", "j", "lowerBB", "redBarCount", "barDrop",
+        "brokenBB", "vol_increasing", "vol_over_20m"
+    ]
+    # 只选最后 5 根
+    print(df[cols_to_show].tail(5).to_string(index=False))
+    print("====================================\n")
+    # —— 调试打印结束 —— #
+
+
 
     # 9.3 判断信号
     action, price = check_signals(df, state)
