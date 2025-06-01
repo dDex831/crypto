@@ -35,7 +35,8 @@ def load_state():
         return {
             "inPosition": False,     # 是否持仓
             "entryTime": None,       # 持仓时的时间戳（UTC）
-            "entryPrice": None       # 持仓时的进场价格
+            "entryPrice": None,      # 持仓时的进场价格
+            "entryQty": None         # 持仓时的合约数量
         }
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -140,7 +141,7 @@ def check_signals(df: pd.DataFrame, state: dict):
             action = "SELL_TP"
             return action, price
 
-        # 6.2.2 持仓超过 3 天 (即 18 根 4h K 线) 且当前 close ≥ entry_price （回本）才平仓
+        # 6.2.2 持仓超过 3 天 (即 18 根 4h K 线) 且当前 close ≥ entry_price（回本）才平仓
         if (now >= entry_time + timedelta(days=3)) and (price >= entry_price):
             action = "SELL_3D"
             return action, price
@@ -175,11 +176,10 @@ def place_order(action: str, symbol: str, quantity: float):
         print(f"{datetime.now()} 下单失败：{e}")
         return None
 
-# ========== 8. 计算仓位数量（全仓 300 USDT 为例）==========
+# ========== 8. 计算仓位数量（按 USDT 余额） ===========
 def calc_quantity(usdt_amount: float, price: float):
     """
-    简化：300 USDT 全仓买入，按市价计算买多少 ADA。
-    向下取整保留精度到 0.001。
+    计算在当前价格下，用 usdt_amount（USDT）可以购买多少 ADA（现货或合约按市价）。向下取整保留精度到 0.001。
     """
     step_size = 0.001
     qty = usdt_amount / price
@@ -210,26 +210,37 @@ def main():
     action, price = check_signals(df, state)
 
     if action == "BUY":
-        usdt_amount = 300
+        usdt_amount = 200
+        # 9.3.1 计算买入数量
         qty = calc_quantity(usdt_amount, price)
 
+        # 9.3.2 下买单
         order = place_order("BUY", SYMBOL, qty)
         if order:
+            # 更新状态：记录 inPosition、entryPrice、entryTime 以及 entryQty
             state["inPosition"] = True
             state["entryPrice"] = price
+            state["entryQty"] = qty
             last_time = df.iloc[-1]["open_time"]
             state["entryTime"] = last_time.replace(tzinfo=timezone.utc).isoformat()
-            print(f"{datetime.now()} 记录持仓状态：入场价格 {price}，时间 {state['entryTime']}")
+            print(
+                f"{datetime.now()} 记录持仓状态：入场价格 {price}，入场数量 {qty}，时间 {state['entryTime']}"
+            )
 
     elif action in ("SELL_TP", "SELL_3D"):
-        entry_price = state["entryPrice"]
-        qty = calc_quantity(300, entry_price)
-        order = place_order("SELL", SYMBOL, qty)
-        if order:
-            print(f"{datetime.now()} 执行平仓动作：{action}")
-            state["inPosition"] = False
-            state["entryPrice"] = None
-            state["entryTime"] = None
+        # 9.3.3 平仓：直接用保存的 entryQty，而不是重新计算
+        qty = state.get("entryQty")
+        if qty is None:
+            print(f"{datetime.now()} 错误：找不到 entryQty，无法平仓")
+        else:
+            order = place_order("SELL", SYMBOL, qty)
+            if order:
+                print(f"{datetime.now()} 执行平仓动作：{action}，卖出数量 {qty}")
+                # 清空状态
+                state["inPosition"] = False
+                state["entryPrice"] = None
+                state["entryTime"] = None
+                state["entryQty"] = None
 
     else:
         print(f"{datetime.now()} 无操作信号。当前持仓状态：{state}")
@@ -273,14 +284,13 @@ def test_trade_futures():
         print(f"{datetime.now()} 下单卖出 20 张 ADA 合约，订单信息：{sell_order}")
 
     except BinanceAPIException as e:
-        print(f"{datetime.now()} 测试下单失败：{e}")    
-
+        print(f"{datetime.now()} 测试下单失败：{e}")
 
 if __name__ == "__main__":
     # 运行主流程
     main()
 
     # —— 执行测试下单 —— #
-    # print("\n===== 开始测试：合约账户市价买入5 ADA，3 秒后卖出 =====")
+    # print("\n===== 开始测试：合约账户市价买入20 ADA，3 秒后卖出 =====")
     # test_trade_futures()
     # print("===== 测试结束 =====\n")
