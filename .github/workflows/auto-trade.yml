@@ -8,7 +8,7 @@ on:
 jobs:
   run_auto_trade:
     name: Run Auto Trade Script
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]   # ← 这里改成 self-hosted
 
     steps:
       # 1. Checkout 代码
