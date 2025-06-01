@@ -2,7 +2,7 @@ name: "Auto Trade Bot"
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 每 5 分钟执行一次（注意 GitHub 会按照 “最近的 5 分钟倍数” 来跑）
+    - cron: "*/10 * * * *"   # 每 5 分钟执行一次（注意 GitHub 会按照 “最近的 5 分钟倍数” 来跑）
   workflow_dispatch:
 
 jobs:
