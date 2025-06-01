@@ -82,7 +82,7 @@ def compute_indicators(df: pd.DataFrame):
 
     # 5.2 计算 Bollinger Band 下轨
     basis = df["close"].rolling(window=20).mean()
-    dev = df["close"].rolling(window=20).std()
+    dev = df["close"].rolling(window=20).std(ddof=0)
     df["lowerBB"] = basis - 2 * dev
 
     # 5.3 计算红棒（close < open）并统计最近 10 根红棒数量
