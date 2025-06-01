@@ -74,77 +74,114 @@ def compute_indicators(df: pd.DataFrame):
       - 'lowerBB' (Bollinger 下轨，ddof=0，与 TradingView 一致)
       - 以及红棒统计 redBarCount、barDrop（当根跌幅）、vol_increasing、vol_over_20m
     """
-    # 5.1 计算 Stochastic %K, %D, %J
+    # 1. 计算 Stochastic %K, %D, %J
     low_min = df["low"].rolling(window=14).min()
     high_max = df["high"].rolling(window=14).max()
     df["k"] = 100 * (df["close"] - low_min) / (high_max - low_min)
     df["d"] = df["k"].rolling(window=3).mean()
     df["j"] = 3 * df["k"] - 2 * df["d"]
 
-    # 5.2 计算 Bollinger Band 下轨 (总体标准差 ddof=0)
+    # 2. 计算 Bollinger Band 下轨 (总体标准差 ddof=0)
     basis = df["close"].rolling(window=20).mean()
     dev = df["close"].rolling(window=20).std(ddof=0)
     df["lowerBB"] = basis - 2 * dev
 
-    # 5.3 计算红棒（close < open）并统计最近 10 根红棒数量
+    # 3. 红棒 = close < open，最近 10 根红棒数量
     df["is_red"] = (df["close"] < df["open"]).astype(int)
     df["redBarCount"] = df["is_red"].rolling(window=10).sum()
 
-    # 5.4 当根“开→收”跌幅 ≥ 7%
+    # 4. 当根“开→收”跌幅 ≥ 7%
     df["barDrop"] = ((df["open"] - df["close"]) / df["open"] * 100) >= 7
 
-    # 5.5 原有条件细项
+    # 5. 其余条件
     df["brokenBB"] = df["low"] < df["lowerBB"]
     df["vol_increasing"] = df["volume"] > df["volume"].shift(1) * 1.5
     df["vol_over_20m"] = df["volume"] > 20_000_000
 
     return df
 
+
 # ========== 6. 判断进场／出场信号 ==========
 def check_signals(df: pd.DataFrame, state: dict):
     """
-    根据最后一根 K 线（即 DataFrame 最后一行），判断是否产生新的进场信号或需要平仓。
+    完全参照你给的 Pine Script：
+      - 用 “倒数第2 行” 作为 last（上一根已收盘 4h K 线）
+      - 用 “倒数第3 行” 作为 prev（再前一根已收盘 4h K 线）
+      - 严格沿用 Pine Script 里所有条件（j<=15、跌破布林带、量增、当根量＞20M、8/10 红棒、bar_drop）
+      - 平仓：获利 ≥ 1.5% → 立即；或者持仓超过 72 根（约 3 天）且 “回本（close == entryPrice）” 才平
     返回：
-      - action: "BUY", "SELL_TP", "SELL_3D", 或 None
-      - price:  本 K 线的 close 价格
+      - action: "BUY" / "SELL_TP" / "SELL_3D" / None
+      - price: 触发信号时 用的收盘价
     """
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    # 确保行数足够：至少要 3 根 K 线才能取到 df.iloc[-3]
+    if len(df) < 3:
+        return None, None
 
-    # 6.1 判断是否触发“进场”条件
-    cond_original = (
-        (last["j"] <= 15) and
-        last["brokenBB"] and
-        last["vol_increasing"] and
-        (last["j"] > prev["j"]) and
-        last["vol_over_20m"]
-    )
-    cond_8_of_10_red = last["redBarCount"] >= 8
-    condition = cond_original or last["barDrop"] or cond_8_of_10_red
-    alert_on_next_bar = condition and (not (prev.get("condition_flag", False)))
-
-    # 6.2 判断是否需要“平仓”
-    action = None
+    # —— 对应 Pine Script 的 last = df.iloc[-2]，prev = df.iloc[-3] —— #
+    last = df.iloc[-2]
+    prev = df.iloc[-3]
     price = last["close"]
 
-    if (not state["inPosition"]) and alert_on_next_bar:
-        action = "BUY"
-        return action, price
+    # —— 计算 Stochastic、Bollinger、红棒等 —— #
+    j        = last["j"]
+    j_prev   = prev["j"]
+    brokenBB = last["brokenBB"]
+    vol_inc  = last["vol_increasing"]
+    vol_20m  = last["vol_over_20m"]
 
-    if state["inPosition"]:
+    # 条件 A： j ≤ 15 且 跌破布林带 且 量增 且 j 向上 且 当根量 > 20M
+    cond_original = (j <= 15) and brokenBB and vol_inc and (j > j_prev) and vol_20m
+
+    # 条件 B： 当根“开 → 收”跌幅 ≥ 7%
+    bar_drop = last["barDrop"]  # 已在 compute_indicators 里算好
+
+    # 条件 C： 最近 10 根中 ≥ 8 根为红棒（close < open）
+    #       DataFrame 已在 compute_indicators 里有 redBarCount = 最近 10 根红棒数
+    cond_8_of_10_red = last["redBarCount"] >= 8
+
+    # 合并：A or B or C
+    condition = cond_original or bar_drop or cond_8_of_10_red
+
+    # alert_on_next_bar = condition and not condition[1]  —— 这里的 “condition[1]” 对应 prev 的 condition 标志
+    # 但我们没有把 condition 存进 df，所以下面手动复刻：上一根 prev 的 condition_prev
+    # 所以先算 prev_condition：
+    j2        = prev["j"]
+    brokenBB2 = prev["brokenBB"]
+    vol_inc2  = prev["vol_increasing"]
+    vol_202m  = prev["vol_over_20m"]
+    cond_orig_prev = (j2 <= 15) and brokenBB2 and vol_inc2 and (j2 > df.iloc[-4]["j"]) and vol_202m \
+                     if len(df) >= 4 else False
+    bar_drop_prev = prev["barDrop"]
+    cond_red_prev = prev["redBarCount"] >= 8
+    condition_prev = cond_orig_prev or bar_drop_prev or cond_red_prev
+
+    alert_on_next_bar = condition and (not condition_prev)
+
+    # —— 进场逻辑 —— #
+    if (not state.get("inPosition", False)) and alert_on_next_bar:
+        # BUY：用上一根 K 线的收盘价作买入价
+        return "BUY", price
+
+    # —— 平仓逻辑 —— #
+    if state.get("inPosition", False):
         entry_price = state["entryPrice"]
+        # Pine Script 里 entryBar = bar_index，当时存的是 index，所以此处只取时间
+        # 但我们 Python 版只关心“持仓条数” -> 可用 K 线数来算是否 72 根
+        # 所以如果要判断“持仓超过 72 根”可以设定：假定 state 里存了 entry_bar_index 或 entry_time
+        #
+        # 为了跟你原来的逻辑保持一致，这里直接取“上一根 K 线的 open_time”与 “entryTime” 对比
+        last_time = last["open_time"]  # 上一根 K 线的开盘时间（UTC）
         entry_time = datetime.fromisoformat(state["entryTime"])
-        now = last["open_time"]  # 本根 K 线的收盘时间（UTC）
-        # 6.2.1 持仓获利 ≥ 1.5% 立即平仓
+
+        # 4-1. 如果（last.close - entryPrice）/ entryPrice * 100 ≥ 1.5% → SELL_TP
         profit_pct = (price - entry_price) / entry_price * 100
         if profit_pct >= 1.5:
-            action = "SELL_TP"
-            return action, price
+            return "SELL_TP", price
 
-        # 6.2.2 持仓超过 3 天 (即 18 根 4h K 线) 且当前 close ≥ entry_price（回本）才平仓
-        if (now >= entry_time + timedelta(days=3)) and (price >= entry_price):
-            action = "SELL_3D"
-            return action, price
+        # 4-2. 如果持仓超过 72 根 4h K 线（也是约 3 天），且 “回本（last.close == entryPrice）” 才平仓
+        #     Pine Script 用的是 bar_index 计数，但我们用时间也可等效：用 entryTime + 3 天判断
+        if (last_time >= entry_time + timedelta(days=3)) and (price >= entry_price):
+            return "SELL_3D", price
 
     return None, None
 
@@ -235,6 +272,8 @@ def main():
     df = fetch_klines(SYMBOL, INTERVAL, limit=LIMIT)
     df = compute_indicators(df)
 
+    action, price = check_signals(df, state)
+
     # —— 调试打印：最近 5 根 K 线与指标 —— #
     print("\n===== 最近 5 根 4h K 线与指标 =====")
     cols_to_show = [
@@ -247,7 +286,7 @@ def main():
     # —— 调试打印结束 —— #
 
     # 10.4 判断信号
-    action, price = check_signals(df, state)
+    
 
     if action == "BUY":
         usdt_amount = 200
@@ -269,7 +308,7 @@ def main():
             state["inPosition"] = True
             state["entryPrice"] = avg_price
             state["entryQty"] = total_qty
-            last_time = df.iloc[-1]["open_time"]
+            last_time = df.iloc[-2]["open_time"]
             state["entryTime"] = last_time.replace(tzinfo=timezone.utc).isoformat()
             print(
                 f"{datetime.now()} 记录持仓状态：实际入场价 {avg_price:.6f}，入场数量 {total_qty:.3f}，时间 {state['entryTime']}"
