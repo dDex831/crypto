@@ -1,345 +1,245 @@
-# auto_trade.py
+# 文件路径：auto_trade/auto_trade.py
 
 import os
 import json
-import requests
+import math
+import time
+from datetime import datetime, timezone, timedelta
+
 import pandas as pd
 import numpy as np
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
-from pybit.unified_trading import HTTP as BybitV5HTTP
-from pybit.exceptions import FailedRequestError
+# ========== 1. Binance API 初始化 ==========
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+if not API_KEY or not API_SECRET:
+    raise ValueError("请先在环境变量中设置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
 
-# ----------------------------
-# 1. 从环境变量读取 Bybit API Key/Secret
-# ----------------------------
-BYBIT_API_KEY    = os.getenv("BYBIT_API_KEY")
-BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-if not BYBIT_API_KEY or not BYBIT_API_SECRET:
-    raise ValueError("请先在环境变量设定 BYBIT_API_KEY 和 BYBIT_API_SECRET")
+client = Client(API_KEY, API_SECRET)
 
-# ----------------------------
-# 是否启用“测试下单模式”：直接下市价单 5 合约（3 倍杠杆）
-# ----------------------------
-TEST_ORDER = os.getenv("TEST_ORDER", "false").lower() == "true"
+# ========== 2. 参数配置 ==========
+SYMBOL = "ADAUSDT"           # 交易对
+INTERVAL = Client.KLINE_INTERVAL_4HOUR  # 4h K 线
+LIMIT = 100                  # 拉取最近 100 根 K 线即可
+POSITION_SIDE = "LONG"       # 本示例只做多单，不做空单
 
-# ----------------------------
-# 2. 用 pybit v5 建立 HTTP 客户端 (USDT 永续合约)
-#    如果要跑 Testnet，把 testnet=True
-# ----------------------------
-client = BybitV5HTTP(
-    testnet=False,
-    api_key    = BYBIT_API_KEY,
-    api_secret = BYBIT_API_SECRET
-)
+# 状态文件路径（与本脚本同目录）
+STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 
-# ----------------------------
-# 3. 先设杠杆 3 倍
-# ----------------------------
-def ensure_leverage():
-    try:
-        client.set_leverage(symbol="ADAUSDT", leverage=3)
-        print(f"[{pd.Timestamp.now()}] 杠杆设置成功：ADAUSDT = 3 倍")
-    except FailedRequestError as e:
-        print(f"[{pd.Timestamp.now()}] Warning: 设置杠杆时发生错误，已跳过。错误信息：{e}")
-
-print(f"[{pd.Timestamp.now()}] 初始化：即将设置杠杆 3 倍。")
-ensure_leverage()
-
-# ----------------------------
-# 4. 参数设置
-# ----------------------------
-SYMBOL      = "ADAUSDT"   # 交易对：ADA/USDT 永续合约
-FETCH_LIMIT = 200         # 拉取最近 200 根 1 小时 K 线
-
-# Stochastic 参数（Bar 数量）
-STOCH_K     = 14
-STOCH_D     = 3
-
-# Bollinger Bands 参数（Bar 数量、标准差倍数）
-BB_LENGTH   = 20
-BB_MULT     = 2.0
-
-# ----------------------------
-# 5. 持仓状态保存 (state.json)
-# ----------------------------
-STATE_FILENAME = "state.json"
-
+# ========== 3. 工具函数：加载/保存持仓状态 ==========
 def load_state():
-    if os.path.isfile(STATE_FILENAME):
-        with open(STATE_FILENAME, "r") as f:
-            return json.load(f)
-    else:
-        return {"in_position": False, "entry_price": None, "entry_time": None}
+    """从 state.json 加载持仓状态，如果文件不存在，则返回初始状态。"""
+    if not os.path.exists(STATE_FILE):
+        return {
+            "inPosition": False,     # 是否持仓
+            "entryTime": None,       # 持仓时的时间戳（UTC）
+            "entryPrice": None       # 持仓时的进场价格
+        }
+    with open(STATE_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def save_state(state):
-    with open(STATE_FILENAME, "w") as f:
-        json.dump(state, f)
+def save_state(state: dict):
+    """将持仓状态写回 state.json。在 workflow 中会检测到变更并自动提交。"""
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
-# ----------------------------
-# 6. 拉 K 线并转换成 pandas.DataFrame（使用 CryptoCompare 公共接口）
-#    并转换成台湾本地时间 (Asia/Taipei)
-# ----------------------------
-def fetch_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
+# ========== 4. 拉取 4h K 线数据，并转换为 DataFrame ==========
+def fetch_klines(symbol, interval, limit=LIMIT):
     """
-    通过 CryptoCompare 公共 REST API 获取 ADA/USDT 小时 K 线，不带 API Key。
-    将 open_time 从 UTC 转成 Asia/Taipei 时区，让你直接看到台湾本地时间。
-    返回 pandas.DataFrame:
-      index: open_time (pd.Timestamp with tz='Asia/Taipei')
-      columns: open, high, low, close, volume
-    参数：
-      symbol: "ADAUSDT"  -> 拆成 fsym="ADA" 和 tsym="USDT"
-      limit: 最多返回几根历史 K 线，最大200
+    返回一个 pandas.DataFrame，字段包括：
+    ['open_time', 'open', 'high', 'low', 'close', 'volume', ...]
+    open_time 单位为毫秒。
     """
-    fsym = symbol[:-4]   # "ADAUSDT" -> "ADA"
-    tsym = symbol[-4:]   # "ADAUSDT" -> "USDT"
+    klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(klines, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "number_of_trades",
+        "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
+    ])
+    # 转换类型
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    return df
 
-    url = "https://min-api.cryptocompare.com/data/v2/histohour"
-    params = {
-        "fsym": fsym,
-        "tsym": tsym,
-        "limit": limit
-    }
-
-    print(f"[{pd.Timestamp.now()}] → 开始请求 CryptoCompare K 线 (symbol={symbol}, limit={limit})")
-    try:
-        r = requests.get(url, params=params, timeout=10)
-    except Exception as e:
-        raise RuntimeError(f"调用 CryptoCompare K-line 接口时网络错误: {e}")
-
-    print(f"[{pd.Timestamp.now()}] ← CryptoCompare HTTP 状态码: {r.status_code}")
-    if r.status_code != 200:
-        raise RuntimeError(f"CryptoCompare K-line HTTP 错误: Status {r.status_code}, Response: {r.text}")
-
-    try:
-        data = r.json()
-    except Exception as e:
-        raise RuntimeError(f"CryptoCompare K-line 返回无法解析为 JSON: {e} | Raw Response: {r.text}")
-
-    if data.get("Response") != "Success" or "Data" not in data or "Data" not in data["Data"]:
-        raise RuntimeError(f"CryptoCompare K-line 数据格式异常: {data}")
-
-    ohlc_list = data["Data"]["Data"]
-    df = pd.DataFrame(ohlc_list)
-
-    # 把 "time"（Unix 秒）转成 UTC 时区的 Timestamp
-    df["open_time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-    # 再把它从 UTC 转到 Asia/Taipei
-    df["open_time"] = df["open_time"].dt.tz_convert("Asia/Taipei")
-    # 设成索引
-    df = df.set_index("open_time")
-
-    # 转成我们需要的列，并转换为 float
-    df2 = pd.DataFrame({
-        "open": df["open"].astype(float),
-        "high": df["high"].astype(float),
-        "low":  df["low"].astype(float),
-        "close": df["close"].astype(float),
-        # 使用 volumefrom 做 volume
-        "volume": df["volumefrom"].astype(float)
-    }, index=df.index)
-
-    print(f"[{pd.Timestamp.now()}] ← 成功拿到 {len(df2)} 根 K 线，最后一根时间（台北时区）：{df2.index[-1]}, 收盘价：{df2['close'].iloc[-1]:.6f}")
-    return df2
-
-# ----------------------------
-# 7. 计算可用余额并返回可下单合约数
-# ----------------------------
-def calculate_lot_size(symbol: str, leverage: int) -> float:
+# ========== 5. 计算指标：Stochastic、Bollinger Band 等 ==========
+def compute_indicators(df: pd.DataFrame):
     """
-    1. 从 Bybit v5 Wallet Balance API 拿到可用 USDT
-    2. 用最近一根 K 线收盘价当作“标记价”近似
-    3. 公式：lot_count = floor(available_usdt * leverage / mark_price)
+    输入：包含 open, high, low, close, volume 的 DataFrame，按时间升序排列。
+    输出：原 DataFrame 直接新增列：
+      - 'k', 'd', 'j' (Stochastic)
+      - 'lowerBB' (Bollinger 下轨)
+      - 以及红棒统计 redBarCount、barDrop（当根跌幅）、volume_20m_flag（量 > 20M）
     """
-    balances = client.get_wallet_balance(coin="USDT")
-    if "result" not in balances or "USDT" not in balances["result"]:
-        raise RuntimeError(f"get_wallet_balance 返回异常: {balances}")
-    available_usdt = float(balances["result"]["USDT"]["available_balance"])
-    print(f"[{pd.Timestamp.now()}] 可用 USDT 余额: {available_usdt:.4f}")
+    # 5.1 计算 Stochastic %K, %D, %J
+    low_min = df["low"].rolling(window=14).min()
+    high_max = df["high"].rolling(window=14).max()
+    df["k"] = 100 * (df["close"] - low_min) / (high_max - low_min)
+    df["d"] = df["k"].rolling(window=3).mean()
+    df["j"] = 3 * df["k"] - 2 * df["d"]
 
-    # 拿最近 5 根 1h K 线，最后一根的 close 当作标记价
-    klines = fetch_klines(symbol, limit=5)
-    mark_price = klines["close"].iloc[-1]
-    print(f"[{pd.Timestamp.now()}] 标记价 (最近 1h 收盘): {mark_price:.6f}")
+    # 5.2 计算 Bollinger Band 下轨
+    basis = df["close"].rolling(window=20).mean()
+    dev = df["close"].rolling(window=20).std()
+    df["lowerBB"] = basis - 2 * dev
 
-    raw_size = (available_usdt * leverage) / mark_price
-    # ADAUSDT 永续合约一般精度到小数后 3 位
-    size = float(f"{raw_size:.3f}")
-    print(f"[{pd.Timestamp.now()}] 计算出可下单合约数: {size:.3f}")
-    return size
+    # 5.3 计算红棒（close < open）并统计最近 10 根红棒数量
+    df["is_red"] = (df["close"] < df["open"]).astype(int)
+    df["redBarCount"] = df["is_red"].rolling(window=10).sum()
 
-# ----------------------------
-# 8. 用 pandas + numpy 手动计算 Stochastic & Bollinger Bands
-# ----------------------------
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    # 5.4 当根“开→收”跌幅 ≥ 7%
+    df["barDrop"] = ((df["open"] - df["close"]) / df["open"] * 100) >= 7
+
+    # 5.5 原有条件细项
+    df["brokenBB"] = df["low"] < df["lowerBB"]
+    df["vol_increasing"] = df["volume"] > df["volume"].shift(1) * 1.5
+    df["vol_over_20m"] = df["volume"] > 20_000_000
+
+    return df
+
+# ========== 6. 判断进场／出场信号 ==========
+def check_signals(df: pd.DataFrame, state: dict):
     """
-    输入 df：必须包含 open, high, low, close, volume
-    输出 df：新增 stoch_k, stoch_d, stoch_j, bb_lower
+    根据最后一根 K 线（即 DataFrame 最后一行），判断是否产生新的进场信号或需要平仓。
+    返回：
+      - action: "BUY", "SELL_TP", "SELL_3D", 或 None
+      - price:  本 K 线的 close 价格 (执行下单时可略微调整为市价单，直接传 None 即可)
     """
-    low_n   = df["low"].rolling(window=STOCH_K).min()
-    high_n  = df["high"].rolling(window=STOCH_K).max()
-    stoch_k = (df["close"] - low_n) / (high_n - low_n) * 100
-    stoch_d = stoch_k.rolling(window=STOCH_D).mean()
-    stoch_j = 3 * stoch_k - 2 * stoch_d
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    ma20    = df["close"].rolling(window=BB_LENGTH).mean()
-    std20   = df["close"].rolling(window=BB_LENGTH).std()
-    bb_lower= ma20 - BB_MULT * std20
+    # 6.1 判断是否触发“进场”条件
+    cond_original = (
+        (last["j"] <= 15) and
+        last["brokenBB"] and
+        last["vol_increasing"] and
+        (last["j"] > prev["j"]) and
+        last["vol_over_20m"]
+    )
+    cond_8_of_10_red = last["redBarCount"] >= 8
+    condition = cond_original or last["barDrop"] or cond_8_of_10_red
+    alert_on_next_bar = condition and (not (prev.get("condition_flag", False)))
 
-    df_ = df.copy()
-    df_["stoch_k"]  = stoch_k
-    df_["stoch_d"]  = stoch_d
-    df_["stoch_j"]  = stoch_j
-    df_["bb_lower"] = bb_lower
-    return df_
+    # 6.2 判断是否需要“平仓”
+    action = None
+    price = last["close"]
 
-# ----------------------------
-# 9. 核心策略逻辑：判断买入/卖出、控制持仓
-#    增加打印最后几行指标 & 信号打印
-# ----------------------------
-def strategy_logic(df: pd.DataFrame, state: dict) -> dict:
-    in_position = state["in_position"]
-    entry_price = state["entry_price"]
-    entry_time  = state["entry_time"]
+    # 如果当前没有持仓，且本根 K 线产生进场信号
+    if (not state["inPosition"]) and alert_on_next_bar:
+        action = "BUY"
+        return action, price
 
-    # 如果 Bar 数量不足，就先不操作
-    if len(df) < max(STOCH_K, BB_LENGTH) + 2:
-        print(f"[{pd.Timestamp.now()}] K 线数量不足，结束当前轮询 (共 {len(df)} 根)。")
-        return state
-
-    # 计算所有指标
-    df_ind = compute_indicators(df)
-    # 打印最后 3 根指标示例
-    print(f"[{pd.Timestamp.now()}] → 指标计算完成，示例（最后 3 行）:")
-    print(df_ind.tail(3)[["stoch_k", "stoch_d", "stoch_j", "bb_lower"]])
-
-    # 拿最后一根 K 线的数据
-    last_idx   = df_ind.index[-1]
-    last_open  = df_ind["open"].iloc[-1]
-    last_close = df_ind["close"].iloc[-1]
-    last_low   = df_ind["low"].iloc[-1]
-    last_vol   = df_ind["volume"].iloc[-1]
-    prev_vol   = df_ind["volume"].iloc[-2]
-    prev_j     = df_ind["stoch_j"].iloc[-2]
-    curr_j     = df_ind["stoch_j"].iloc[-1]
-    lower_band = df_ind["bb_lower"].iloc[-1]
-
-    print(f"[{pd.Timestamp.now()}] 最后一根 K 线时间 (台北时区): {last_idx}, 收盘价: {last_close:.6f}, 低: {last_low:.6f}, 成交量: {last_vol:.2f}")
-    print(f"[{pd.Timestamp.now()}] %J 前:{prev_j:.2f}，当前:{curr_j:.2f}，BB 下轨: {lower_band:.6f}")
-
-    # 9.1 原始买入条件：%J ≤ 15 且 跌破 BB 下轨、成交量放大、%J 向上、当根量 > 20M
-    cond_j_low       = curr_j <= 15
-    cond_broken_bb   = last_low < lower_band
-    cond_vol_up      = last_vol > prev_vol
-    cond_j_rising    = curr_j > prev_j
-    cond_vol_over20m = last_vol > 20_000_000
-    buy_cond         = cond_j_low and cond_broken_bb and cond_vol_up and cond_j_rising and cond_vol_over20m
-
-    # 9.2 或当根 K 线跌幅 ≥ 7%，也算买入
-    bar_drop = ((last_open - last_close) / last_open * 100) >= 7
-    final_buy_cond = buy_cond or bar_drop
-
-    size = None
-    # 9.3 如果当前没持仓且满足买入条件 → 全仓 3 倍杠杆下多单
-    if (not in_position) and final_buy_cond:
-        print(f"[{pd.Timestamp.now()}] 买入条件满足，准备下多单。")
-        size = calculate_lot_size(SYMBOL, leverage=3)
-        print(f"[{pd.Timestamp.now()}] → 下单信息：杠杆×3，合约数={size:.3f}, 价格≈{last_close:.6f}")
-        resp = client.place_order(
-            category  = "linear",
-            symbol    = SYMBOL,
-            side      = "Buy",
-            orderType = "Market",
-            qty       = size
-        )
-        print(f"[{pd.Timestamp.now()}] 多单下单响应：{resp}")
-        in_position = True
-        entry_price = last_close
-        entry_time  = last_idx.strftime("%Y-%m-%d %H:%M:%S")
-
-    # 9.4 如果已经持仓，则检查平仓条件
-    elif in_position:
-        print(f"[{pd.Timestamp.now()}] 当前已有持仓，检查平仓条件。")
-        if size is None:
-            size = calculate_lot_size(SYMBOL, leverage=3)
-
-        profit_pct = (last_close - entry_price) / entry_price * 100
-        print(f"[{pd.Timestamp.now()}] 盈亏比例: {profit_pct:.2f}% (当前价 {last_close:.6f} vs 进场价 {entry_price:.6f})")
-
-        # (A) 如果盈利 ≥ 1.5% → 平仓
+    # 如果当前持仓
+    if state["inPosition"]:
+        entry_price = state["entryPrice"]
+        entry_time = datetime.fromisoformat(state["entryTime"])
+        now = last["open_time"]  # 本根 K 线的收盘时间（UTC）
+        # 6.2.1 持仓获利 ≥ 1.5% 立即平仓
+        profit_pct = (price - entry_price) / entry_price * 100
         if profit_pct >= 1.5:
-            print(f"[{pd.Timestamp.now()}] 盈利 ≥ 1.5%，市价平仓 Sell。")
-            resp = client.place_order(
-                category  = "linear",
-                symbol    = SYMBOL,
-                side      = "Sell",
-                orderType = "Market",
-                qty       = size
-            )
-            print(f"[{pd.Timestamp.now()}] 空单平仓响应：{resp}")
-            in_position = False
-            entry_price = None
-            entry_time  = None
+            action = "SELL_TP"
+            return action, price
 
-        # (B) 如果持仓 ≥ 3 天 (4320 分钟) 且收盘价回到进场价 → 平仓
-        if entry_time:
-            held_minutes = (pd.to_datetime(last_idx) - pd.to_datetime(entry_time)).total_seconds() / 60
-            if held_minutes >= 4320 and abs(last_close - entry_price) < 1e-8:
-                print(f"[{pd.Timestamp.now()}] 持仓 {held_minutes/60:.1f} 小时 (>72 小时) 且回本 → 平仓。")
-                resp = client.place_order(
-                    category  = "linear",
-                    symbol    = SYMBOL,
-                    side      = "Sell",
-                    orderType = "Market",
-                    qty       = size
-                )
-                print(f"[{pd.Timestamp.now()}] 3 天回本平仓响应：{resp}")
-                in_position = False
-                entry_price = None
-                entry_time  = None
+        # 6.2.2 持仓超过 3 天 (即 18 根 4h K 线) 且当前 close ≥ entry_price （回本）才平仓
+        if (now >= entry_time + timedelta(days=3)) and (price >= entry_price):
+            action = "SELL_3D"
+            return action, price
 
-    # 9.5 更新并返回最新持仓状态
-    new_state = {
-        "in_position": in_position,
-        "entry_price": entry_price,
-        "entry_time":  entry_time,
-    }
-    return new_state
+    return None, None
 
-# ----------------------------
-# 10. 主程序：拉 K 线 → 或直接测试下单 → 执行策略 → 下单 → 更新 state.json
-# ----------------------------
-def main():
-    state = load_state()
-    print(f"[{pd.Timestamp.now()}] 当前持仓状态: {state}")
-
-    # 如果 TEST_ORDER=True，就直接市价买入 5 合约，然后结束脚本
-    if TEST_ORDER:
-        print(f"[{pd.Timestamp.now()}] TEST_ORDER 模式：直接市价买入 5 合约 (USDⓈ-M ADAUSDT)，已设杠杆 3 倍。")
-        try:
-            resp = client.place_order(
-                category  = "linear",
-                symbol    = SYMBOL,
-                side      = "Buy",
-                orderType = "Market",
-                qty       = "5"
-            )
-            print(f"[{pd.Timestamp.now()}] 测试下单 5 合约响应：{resp}")
-        except Exception as e:
-            print(f"[{pd.Timestamp.now()}] 测试下单过程中出错：{e}")
-        return  # 结束脚本
-
-    # 非测试模式 → 正常策略逻辑
+# ========== 7. 下单函数 ==========
+def place_order(action: str, symbol: str, quantity: float):
+    """
+    简化示例：默认使用市价单
+    action: "BUY" 或 "SELL"
+    quantity: 买入/卖出数量（以基础币种计）
+    """
     try:
-        df = fetch_klines(SYMBOL, limit=FETCH_LIMIT)
-        new_state = strategy_logic(df, state)
-        if new_state != state:
-            print(f"[{pd.Timestamp.now()}] ⚡ 持仓状态改变: {state} → {new_state}，保存状态。")
-            save_state(new_state)
-        else:
-            print(f"[{pd.Timestamp.now()}] 持仓状态无变化: {state}")
-    except Exception as e:
-        print(f"[{pd.Timestamp.now()}] 执行过程中出错：{e}")
-        raise
+        if action == "BUY":
+            order = client.create_order(
+                symbol=symbol,
+                side=Client.SIDE_BUY,
+                type=Client.ORDER_TYPE_MARKET,
+                quantity=quantity
+            )
+        else:  # SELL
+            order = client.create_order(
+                symbol=symbol,
+                side=Client.SIDE_SELL,
+                type=Client.ORDER_TYPE_MARKET,
+                quantity=quantity
+            )
+        print(f"{datetime.now()} 下单成功：{action}, 订单 ID: {order['orderId']}")
+        return order
+    except BinanceAPIException as e:
+        print(f"{datetime.now()} 下单失败：{e}")
+        return None
+
+# ========== 8. 计算仓位数量（全仓 300 USDT 为例）==========
+def calc_quantity(usdt_amount: float, price: float):
+    """
+    简化：你原策略是 300 USDT 全仓买入，默认按市价计算买多少 ADA。
+    向下取整保留足够最小精度。
+    """
+    # 假设交易对 ADAUSDT 的最小下单数量精度 (step size) 是 0.001，你可以在 API 中查询交易规则来动态获取
+    step_size = 0.001
+    qty = usdt_amount / price
+    qty = math.floor(qty / step_size) * step_size
+    return float(format(qty, f".3f"))
+
+# ========== 9. 主流程 ==========
+def main():
+    # 9.1 加载持仓状态
+    state = load_state()
+
+    # 9.2 拉取数据、计算指标
+    df = fetch_klines(SYMBOL, INTERVAL, limit=LIMIT)
+    df = compute_indicators(df)
+
+    # 为了判断 alert_on_next_bar，需要把前一根的 condition_flag 也带上
+    # 我们把 condition_flag 暂时存在 DataFrame 中，用于下次比较
+    # （实际流水线上，因为每次都重新拉取最新 100 根，DF 中没有 condition_flag，故本示例只在内存里做判断即可）
+    # 这里暂略 condition_flag 的传递，直接在代码里按 “prev” 判断
+
+    # 9.3 判断信号
+    action, price = check_signals(df, state)
+
+    if action == "BUY":
+        # 9.3.1 计算买入数量（假设全仓 300 USDT）
+        usdt_amount = 300
+        qty = calc_quantity(usdt_amount, price)
+
+        # 9.3.2 下买单
+        order = place_order("BUY", SYMBOL, qty)
+        if order:
+            # 更新状态
+            state["inPosition"] = True
+            state["entryPrice"] = price
+            # entryTime 记录为本根 K 线收盘时间（ISO 格式）
+            last_time = df.iloc[-1]["open_time"]
+            state["entryTime"] = last_time.replace(tzinfo=timezone.utc).isoformat()
+            print(f"{datetime.now()} 记录持仓状态：入场价格 {price}，时间 {state['entryTime']}")
+
+    elif action in ("SELL_TP", "SELL_3D"):
+        # 9.3.3 平仓前先查询当前持仓数量
+        # 这里示例直接按照 state["entryPrice"] 计算的数量来卖出，实际可调用账户信息查询精确数量
+        entry_price = state["entryPrice"]
+        qty = calc_quantity(300, entry_price)
+        order = place_order("SELL", SYMBOL, qty)
+        if order:
+            print(f"{datetime.now()} 执行平仓动作：{action}")
+            # 清空状态
+            state["inPosition"] = False
+            state["entryPrice"] = None
+            state["entryTime"] = None
+
+    else:
+        print(f"{datetime.now()} 无操作信号。当前持仓状态：{state}")
+
+    # 9.4 把 state 写回文件，后续由 workflow 检测变更并提交
+    save_state(state)
 
 if __name__ == "__main__":
     main()
