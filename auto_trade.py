@@ -237,44 +237,43 @@ def main():
     # 9.4 把 state 写回文件
     save_state(state)
 
-
-# ========== 10. 测试函数：市价单买入 5 ADA (5x 杠杆)，3 秒后卖出 ==========
+# ========== 10. 测试函数：市价单买入 20 ADA 合约 (5 倍杠杆)，3 秒后卖出 ==========
 def test_trade_futures():
     """
-    在 USDT-M 合约账户上：
-    1) 设置 ADAUSDT 永续合约 5 倍杠杆
-    2) 市价购买 5 手 ADA 合约
+    在 USDT-M 永续合约账户上执行：
+    1) 设置 ADAUSDT 永续合约杠杆为 5 倍
+    2) 市价买入 20 张 ADAUSDT 合约
     3) 等待 3 秒
-    4) 市价卖出 5 手（平仓）
+    4) 市价卖出 20 张（平仓）
     """
     try:
-        # 10.1 设置杠杆
+        # 10.1 设置杠杆为 5 倍
         leverage_resp = client.futures_change_leverage(symbol=SYMBOL, leverage=5)
         print(f"{datetime.now()} 杠杆设置响应：{leverage_resp}")
 
-        # 10.2 市价买入 5 手
+        # 10.2 市价买入 20 张 ADAUSDT 永续合约
         buy_order = client.futures_create_order(
             symbol=SYMBOL,
             side="BUY",
             type="MARKET",
-            quantity=5  # 在合约里表示买入 5 合约单位
+            quantity=20  # 这里改为买入 20 张合约
         )
-        print(f"{datetime.now()} 下单买入 5 手 ADA 合约，订单信息：{buy_order}")
+        print(f"{datetime.now()} 下单买入 20 张 ADA 合约，订单信息：{buy_order}")
 
         # 10.3 等待 3 秒
         time.sleep(3)
 
-        # 10.4 市价卖出 5 手
+        # 10.4 市价卖出 20 张进行平仓
         sell_order = client.futures_create_order(
             symbol=SYMBOL,
             side="SELL",
             type="MARKET",
-            quantity=5  # 平仓：卖出相同数量
+            quantity=20  # 平仓时同样卖出 20 张
         )
-        print(f"{datetime.now()} 下单卖出 5 手 ADA 合约，订单信息：{sell_order}")
+        print(f"{datetime.now()} 下单卖出 20 张 ADA 合约，订单信息：{sell_order}")
 
     except BinanceAPIException as e:
-        print(f"{datetime.now()} 测试下单失败：{e}")
+        print(f"{datetime.now()} 测试下单失败：{e}")    
 
 
 if __name__ == "__main__":
