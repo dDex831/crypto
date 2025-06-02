@@ -289,6 +289,12 @@ def main():
     
 
     if action == "BUY":
+        # —— 先把杠杆调成 3 倍（可按需改为其他倍数） —— #
+        try:
+            client.futures_change_leverage(symbol=SYMBOL, leverage=3)
+        except BinanceAPIException as e:
+            print(f"{datetime.now()} 设置杠杆失败：{e}")
+            return  # 或者
         usdt_amount = 200
         # 10.4.1 计算买入张数
         qty = calc_quantity(usdt_amount, price)
