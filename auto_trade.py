@@ -11,7 +11,9 @@ import numpy as np
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
-# ========== 1. Binance API 初始化 ==========
+# ===============================
+# 1. Binance API 初始化（Spot）
+# ===============================
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 if not API_KEY or not API_SECRET:
@@ -19,39 +21,52 @@ if not API_KEY or not API_SECRET:
 
 client = Client(API_KEY, API_SECRET)
 
-# ========== 2. 参数配置 ==========
-SYMBOL = "ADAUSDT"           # 交易对
+# ===============================
+# 2. 参数配置
+# ===============================
+SYMBOL = "ADAUSDT"               # Spot 交易对
 INTERVAL = Client.KLINE_INTERVAL_4HOUR  # 4h K 线
-LIMIT = 100                  # 拉取最近 100 根 K 线即可
-POSITION_SIDE = "LONG"       # 本示例只做多单，不做空单
+LIMIT = 100                      # 拉取最近 100 根 K 线即可
+POSITION_SIDE = "LONG"           # 这里只做多单示例，不做空单
+
+# 从 SYMBOL 提取 base asset（用于检查现货余额）
+BASE_ASSET = SYMBOL.replace("USDT", "")  # "ADA"
 
 # 状态文件路径（与本脚本同目录）
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 
-# ========== 3. 工具函数：加载/保存持仓状态 ==========
+# ===============================
+# 3. 工具函数：加载/保存持仓状态
+# ===============================
 def load_state():
-    """从 state.json 加载持仓状态，如果文件不存在，则返回初始状态。"""
+    """
+    从 state.json 加载持仓状态，如果文件不存在，则返回初始状态。
+    """
     if not os.path.exists(STATE_FILE):
         return {
             "inPosition": False,     # 是否持仓
             "strategy": None,        # "orig" 或 "mom"
             "entryTime": None,       # 持仓时的时间戳（UTC，ISO 格式）
-            "entryPrice": None,      # 持仓时的实际成交均价
-            "entryQty": None         # 持仓时的实际成交数量（合约张数或现货币数）
+            "entryPrice": None,      # 持仓时的实际成交均价（USD 计价）
+            "entryQty": None         # 持仓时的实际成交数量（ADA 数量）
         }
     with open(STATE_FILE, "r", encoding="utf-8") as f:
         state = json.load(f)
-        # 如果旧状态没有 strategy 字段，补齐
+        # 兼容旧版本没有 strategy 的情况
         if "strategy" not in state:
             state["strategy"] = None
         return state
 
 def save_state(state: dict):
-    """将持仓状态写回 state.json。在 workflow 中会检测到变更并自动提交。"""
+    """
+    将持仓状态写回 state.json。
+    """
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
 
-# ========== 4. 拉取 4h K 线数据，并转换为 DataFrame ==========
+# ===============================
+# 4. 拉取 4h K 线数据，并转换为 DataFrame
+# ===============================
 def fetch_klines(symbol, interval, limit=LIMIT):
     """
     返回一个 pandas.DataFrame，字段包括：
@@ -70,14 +85,16 @@ def fetch_klines(symbol, interval, limit=LIMIT):
         df[col] = df[col].astype(float)
     return df
 
-# ========== 5. 计算指标：Stochastic、Bollinger Band 等 ==========
+# ===============================
+# 5. 计算指标：Stochastic、Bollinger Band 等
+# ===============================
 def compute_indicators(df: pd.DataFrame):
     """
     输入：包含 open, high, low, close, volume 的 DataFrame，按时间升序排列。
-    输出：原 DataFrame 直接新增列：
+    输出：在原 DataFrame 直接新增列：
       - 'k', 'd', 'j' (Stochastic)
       - 'lowerBB', 'upperBB' (Bollinger 下轨和上轨，ddof=0，与 TradingView 一致)
-      - 以及红棒统计 redBarCount、barDrop（当根跌幅）、vol_increasing、vol_over_20m
+      - 以及红棒统计 redBarCount、barDrop、vol_increasing、vol_over_20m
     """
     # 1. 计算 Stochastic %K, %D, %J
     low_min = df["low"].rolling(window=14).min()
@@ -106,7 +123,9 @@ def compute_indicators(df: pd.DataFrame):
 
     return df
 
-# ========== 6. 判断进场／出场信号 ==========
+# ===============================
+# 6. 判断进场／出场信号（和原来完全相同）
+# ===============================
 def check_signals(df: pd.DataFrame, state: dict):
     """
     结合“原有策略”与“动量策略”：
@@ -114,6 +133,7 @@ def check_signals(df: pd.DataFrame, state: dict):
                    平仓：持有动量仓 && (本根收盘 < 前收 OR 浮盈 ≥ 1.5%) && 本根未触及布林上轨 → 立刻平仓
       - 原有策略：与先前保持一致
       - 两者互斥，只能持有其中之一
+
     返回：
       - action: "BUY_MOM", "BUY_ORIG", "SELL_MOM", "SELL_TP", "SELL_3D" 或 None
       - price: 触发信号时 用的收盘价
@@ -130,17 +150,14 @@ def check_signals(df: pd.DataFrame, state: dict):
     price = last["close"]
 
     # ========== 动量策略部分 ==========
-    # 计算本根和前三根涨幅
     pct0 = (last["close"] - last["open"]) / last["open"] * 100
     pct1 = (prev["close"] - prev["open"]) / prev["open"] * 100
     pct2 = (prev2["close"] - prev2["open"]) / prev2["open"] * 100
     pct3 = (prev3["close"] - prev3["open"]) / prev3["open"] * 100
     sum3 = pct1 + pct2 + pct3
 
-    # 本根上影线相对收盘价百分比
     upperShadowPct = (last["high"] - last["close"]) / last["close"] * 100
 
-    # 动量进场条件：本根涨幅>7% 且 sum3≤20 且 上影线≤2%，且当前无持仓
     mom_entry = (
         (pct0 > 7) and 
         (sum3 <= 20) and 
@@ -148,36 +165,28 @@ def check_signals(df: pd.DataFrame, state: dict):
         (not state.get("inPosition", False))
     )
 
-    # 动量平仓条件：持有动量仓且本根未触及布林上轨 且 (收盘<前收 或 浮盈≥1.5%)
     in_mom = state.get("inPosition", False) and state.get("strategy") == "mom"
     touchedUpperBB = last["high"] >= last["upperBB"]
-    profitPctMom = None
     if in_mom:
         profitPctMom = (price - state["entryPrice"]) / state["entryPrice"] * 100
         if (not touchedUpperBB) and ((price < prev["close"]) or (profitPctMom >= 1.5)):
             return "SELL_MOM", price
 
-    # 动量买入信号（优先于原有策略）
     if mom_entry:
         return "BUY_MOM", price
 
     # ========== 原有策略部分 ==========
-    # 计算指标
     j        = last["j"]
     j_prev   = prev["j"]
     brokenBB = last["brokenBB"]
     vol_inc  = last["vol_increasing"]
     vol_20m  = last["vol_over_20m"]
 
-    # A：j ≤15 且 跌破布林带 且 量增 且 j 向上 且 当根量 >20M
     cond_A = (j <= 15) and brokenBB and vol_inc and (j > j_prev) and vol_20m
-    # B：当根“开→收”跌幅 ≥7%
     cond_B = last["barDrop"]
-    # C：最近10根中 ≥8根为红棒
     cond_C = last["redBarCount"] >= 8
-
     orig_entry = (cond_A or cond_B or cond_C) and (not state.get("inPosition", False))
-    # 计算 prev_condition 用于“alert_orig”
+
     j2        = prev["j"]
     brokenBB2 = prev["brokenBB"]
     vol_inc2  = prev["vol_increasing"]
@@ -188,7 +197,6 @@ def check_signals(df: pd.DataFrame, state: dict):
     prev_condition = condA2 or condB2 or condC2
     alert_orig = orig_entry and not prev_condition
 
-    # 原有平仓条件
     in_orig = state.get("inPosition", False) and state.get("strategy") == "orig"
     if in_orig:
         entry_price = state["entryPrice"]
@@ -196,78 +204,73 @@ def check_signals(df: pd.DataFrame, state: dict):
         entry_time  = datetime.fromisoformat(state["entryTime"])
         profitPctOrig = (price - entry_price) / entry_price * 100
 
-        # 1) 持仓浮盈 ≥1.5% 立即平
+        # 1) 持仓浮盈 ≥1.5% 立即平仓
         if profitPctOrig >= 1.5:
             return "SELL_TP", price
-        # 2) 持仓超过3天 且 回本时平
+        # 2) 持仓超过3天 且 回本时平仓
         if (last_time >= entry_time + timedelta(days=3)) and (price >= entry_price):
             return "SELL_3D", price
 
-    # 原有买入信号
     if alert_orig:
         return "BUY_ORIG", price
 
     return None, None
 
-# ========== 7. 下单函数（针对永续合约） ==========
-def place_order(action: str, symbol: str, quantity: float):
+# ===============================
+# 7. 下单函数（Spot 市价单）
+# ===============================
+def place_order_spot(action: str, symbol: str, quantity: float):
     """
     action: "BUY" 或 "SELL"
-    quantity: 合约下单张数（USDT-M 永续合约）
-    这里示例都用市价单，如果要改成限价或其他类型，请自行修改 type/price 参数。
+    quantity: 现货下单数量（base asset 数量，例如 ADA）
+    这里示例都用市价单。
     """
     try:
         if action == "BUY":
-            order = client.futures_create_order(
+            order = client.order_market_buy(
                 symbol=symbol,
-                side=Client.SIDE_BUY,
-                type=Client.ORDER_TYPE_MARKET,
                 quantity=quantity
             )
         else:  # SELL
-            order = client.futures_create_order(
+            order = client.order_market_sell(
                 symbol=symbol,
-                side=Client.SIDE_SELL,
-                type=Client.ORDER_TYPE_MARKET,
                 quantity=quantity
             )
-        print(f"{datetime.now()} 下单成功：{action}, 订单 ID: {order['orderId']}")
+        print(f"{datetime.now()} 下单成功：{action}, 订单 ID: {order.get('orderId', order.get('clientOrderId', 'N/A'))}")
         return order
     except BinanceAPIException as e:
         print(f"{datetime.now()} 下单失败：{e}")
         return None
 
-# ========== 8. 计算合约下单张数（按 USDT 余额） ===========
+# ===============================
+# 8. 计算现货下单数量（按 USDT 余额）
+# ===============================
 def calc_quantity(usdt_amount: float, price: float):
     """
-    计算在当前价格下，用 usdt_amount（USDT）可以在永续合约买多少张 ADA。
-    先按比例算出数量，然后向下取整保留到 0.001 张。
+    计算在当前价格下，用 usdt_amount（USDT）可以在现货市场买多少 base asset（ADA）。
+    先按比例算出数量，然后向下取整保留到 0.001 精度。
     """
     step_size = 0.001
     qty = usdt_amount / price
     qty = math.floor(qty / step_size) * step_size
     return float(format(qty, f".3f"))
 
-# ========== 9. 检查本地状态 vs. 永续合约真实持仓 ==========
-def sync_position_with_api(state: dict):
+# ===============================
+# 9. 同步本地状态 vs. Spot 账户真实持仓
+# ===============================
+def sync_position_with_api_spot(state: dict):
     """
-    如果本地 state["inPosition"] == True，就去 Binance API 查询
-    永续合约仓位（futures position），如果发现该 symbol 在 币安合约
-    账户中 positionAmt == 0，则说明实际已无持仓，需把本地 state 清空。
+    如果本地 state["inPosition"] == True，就去 Binance Spot API 查询余额，
+    如果该资产（BASE_ASSET）可用余额（free） == 0，则说明实际已无持仓，需把本地 state 清空。
     """
     if not state.get("inPosition", False):
         return state
 
     try:
-        positions = client.futures_position_information(symbol=SYMBOL)
-        actual_amt = 0.0
-        for pos in positions:
-            if pos.get("symbol") == SYMBOL:
-                actual_amt = float(pos.get("positionAmt", 0))
-                break
-
-        if actual_amt == 0.0:
-            print(f"{datetime.now()} 检测到持仓为0 → 重置本地状态。")
+        balance = client.get_asset_balance(asset=BASE_ASSET)
+        free_amount = float(balance.get("free", 0.0))
+        if free_amount == 0.0:
+            print(f"{datetime.now()} 检测到现货持仓为0 → 重置本地状态。")
             state["inPosition"] = False
             state["strategy"]   = None
             state["entryPrice"] = None
@@ -275,17 +278,19 @@ def sync_position_with_api(state: dict):
             state["entryQty"]   = None
             save_state(state)
     except BinanceAPIException as e:
-        print(f"{datetime.now()} 同步仓位时出错：{e}")
+        print(f"{datetime.now()} 同步现货持仓时出错：{e}")
 
     return state
 
-# ========== 10. 主流程 ==========
+# ===============================
+# 10. 主流程
+# ===============================
 def main():
     # 10.1 加载持仓状态
     state = load_state()
 
-    # 10.2 同步本地 state 与币安永续合约真实持仓状态
-    state = sync_position_with_api(state)
+    # 10.2 同步本地 state 与现货账户真实持仓状态
+    state = sync_position_with_api_spot(state)
 
     # 10.3 拉取数据、计算指标
     df = fetch_klines(SYMBOL, INTERVAL, limit=LIMIT)
@@ -303,24 +308,21 @@ def main():
     print(df[cols_to_show].tail(5).to_string(index=False))
     print("====================================\n")
 
-    # ========== 10.4 根据信号下单 ==========
+    # ============================
+    # 10.4 根据信号下单（Spot）
+    # ============================
     if action == "BUY_MOM":
-        # 设置杠杆 3 倍
-        try:
-            client.futures_change_leverage(symbol=SYMBOL, leverage=3)
-        except BinanceAPIException as e:
-            print(f"{datetime.now()} 设置杠杆失败：{e}")
-            return
-
         usdt_amount = 200
         qty = calc_quantity(usdt_amount, price)
-        order = place_order("BUY", SYMBOL, qty)
+        order = place_order_spot("BUY", SYMBOL, qty)
         if order:
+            # Spot 买单返回的 fills 可以用来计算平均价格
             fills = order.get("fills", [])
-            total_qty = sum(float(f["qty"]) for f in fills) if fills else qty
             if fills:
+                total_qty = sum(float(f["qty"]) for f in fills)
                 avg_price = sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
             else:
+                total_qty = qty
                 avg_price = price
 
             state["inPosition"] = True
@@ -329,24 +331,19 @@ def main():
             state["entryQty"]   = total_qty
             last_time = df.iloc[-2]["open_time"]
             state["entryTime"] = last_time.replace(tzinfo=timezone.utc).isoformat()
-            print(f"{datetime.now()} 记录动量仓：入场价 {avg_price:.6f}, 数量 {total_qty:.3f}, 时间 {state['entryTime']}")
+            print(f"{datetime.now()} 记录动量仓（现货）：入场价 {avg_price:.6f}, 数量 {total_qty:.3f}, 时间 {state['entryTime']}")
 
     elif action == "BUY_ORIG":
-        try:
-            client.futures_change_leverage(symbol=SYMBOL, leverage=3)
-        except BinanceAPIException as e:
-            print(f"{datetime.now()} 设置杠杆失败：{e}")
-            return
-
         usdt_amount = 200
         qty = calc_quantity(usdt_amount, price)
-        order = place_order("BUY", SYMBOL, qty)
+        order = place_order_spot("BUY", SYMBOL, qty)
         if order:
             fills = order.get("fills", [])
-            total_qty = sum(float(f["qty"]) for f in fills) if fills else qty
             if fills:
+                total_qty = sum(float(f["qty"]) for f in fills)
                 avg_price = sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
             else:
+                total_qty = qty
                 avg_price = price
 
             state["inPosition"] = True
@@ -355,23 +352,24 @@ def main():
             state["entryQty"]   = total_qty
             last_time = df.iloc[-2]["open_time"]
             state["entryTime"] = last_time.replace(tzinfo=timezone.utc).isoformat()
-            print(f"{datetime.now()} 记录原有仓：入场价 {avg_price:.6f}, 数量 {total_qty:.3f}, 时间 {state['entryTime']}")
+            print(f"{datetime.now()} 记录原有仓（现货）：入场价 {avg_price:.6f}, 数量 {total_qty:.3f}, 时间 {state['entryTime']}")
 
     elif action == "SELL_MOM":
         qty = state.get("entryQty")
         if qty is None:
-            print(f"{datetime.now()} 错误：找不到 entryQty，无法平动量仓")
+            print(f"{datetime.now()} 错误：找不到 entryQty，无法平动量仓（现货）")
         else:
-            order = place_order("SELL", SYMBOL, qty)
+            order = place_order_spot("SELL", SYMBOL, qty)
             if order:
                 fills = order.get("fills", [])
-                total_qty = sum(float(f["qty"]) for f in fills) if fills else qty
                 if fills:
+                    total_qty = sum(float(f["qty"]) for f in fills)
                     avg_price = sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
                 else:
+                    total_qty = qty
                     avg_price = price
 
-                print(f"{datetime.now()} 动量仓平仓价 {avg_price:.6f}, 数量 {total_qty:.3f}")
+                print(f"{datetime.now()} 动量仓（现货）平仓价 {avg_price:.6f}, 数量 {total_qty:.3f}")
                 state["inPosition"] = False
                 state["strategy"]   = None
                 state["entryPrice"] = None
@@ -381,18 +379,19 @@ def main():
     elif action == "SELL_TP" or action == "SELL_3D":
         qty = state.get("entryQty")
         if qty is None:
-            print(f"{datetime.now()} 错误：找不到 entryQty，无法平原有仓")
+            print(f"{datetime.now()} 错误：找不到 entryQty，无法平原有仓（现货）")
         else:
-            order = place_order("SELL", SYMBOL, qty)
+            order = place_order_spot("SELL", SYMBOL, qty)
             if order:
                 fills = order.get("fills", [])
-                total_qty = sum(float(f["qty"]) for f in fills) if fills else qty
                 if fills:
+                    total_qty = sum(float(f["qty"]) for f in fills)
                     avg_price = sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
                 else:
+                    total_qty = qty
                     avg_price = price
 
-                print(f"{datetime.now()} 原有仓平仓价 {avg_price:.6f}, 数量 {total_qty:.3f}, 动作 {action}")
+                print(f"{datetime.now()} 原有仓（现货）平仓价 {avg_price:.6f}, 数量 {total_qty:.3f}, 动作 {action}")
                 state["inPosition"] = False
                 state["strategy"]   = None
                 state["entryPrice"] = None
@@ -405,47 +404,36 @@ def main():
     # 10.5 把 state 写回文件
     save_state(state)
 
-# ========== 11. 测试函数：市价单买入 20 张 ADA 永续合约，3 秒后卖出 ==========
-def test_trade_futures():
+# ===============================
+# 11. (可选) 测试函数：Spot 市价单买入/卖出示例
+# ===============================
+def test_trade_spot():
     """
-    在 USDT-M 永续合约账户上执行：
-    1) 设置 ADAUSDT 永续合约杠杆为 3 倍
-    2) 市价买入 20 张 ADAUSDT 合约
-    3) 等待 3 秒
-    4) 市价卖出 20 张（平仓）
+    在 Spot 账户上执行：
+    1) 市价买入 1 ADA（示例，总价近 1 * ADA 当前价格）
+    2) 等待 3 秒
+    3) 市价卖出 1 ADA（平仓）
     """
     try:
-        # 11.1 设置杠杆为 3 倍
-        leverage_resp = client.futures_change_leverage(symbol=SYMBOL, leverage=3)
-        print(f"{datetime.now()} 杠杆设置响应：{leverage_resp}")
-
-        # 11.2 市价买入 20 张 ADAUSDT 永续合约
-        buy_order = client.futures_create_order(
-            symbol=SYMBOL,
-            side="BUY",
-            type="MARKET",
-            quantity=20
-        )
-        print(f"{datetime.now()} 下单买入 20 张 ADA 合约，订单信息：{buy_order}")
-
+        # 11.1 获取市场最新价格
+        ticker = client.get_symbol_ticker(symbol=SYMBOL)
+        price = float(ticker["price"])
+        qty = calc_quantity(1 * price, price)  # 假设用 1 USDT 买入 ADA
+        # 11.2 市价买入
+        buy_order = client.order_market_buy(symbol=SYMBOL, quantity=qty)
+        print(f"{datetime.now()} Spot 下单买入 ADA，订单信息：{buy_order}")
         # 11.3 等待 3 秒
         time.sleep(3)
-
-        # 11.4 市价卖出 20 张进行平仓
-        sell_order = client.futures_create_order(
-            symbol=SYMBOL,
-            side="SELL",
-            type="MARKET",
-            quantity=20
-        )
-        print(f"{datetime.now()} 下单卖出 20 张 ADA 合约，订单信息：{sell_order}")
+        # 11.4 市价卖出同样的 qty
+        sell_order = client.order_market_sell(symbol=SYMBOL, quantity=qty)
+        print(f"{datetime.now()} Spot 下单卖出 ADA，订单信息：{sell_order}")
 
     except BinanceAPIException as e:
-        print(f"{datetime.now()} 测试下单失败：{e}")
+        print(f"{datetime.now()} Spot 测试下单失败：{e}")
 
 if __name__ == "__main__":
     main()
 
-    # —— 如果需要自己测试合约下单，可以取消下面两行注释 —— #
-    # print("\n===== 开始测试：合约账户市价买入20 ADA，3 秒后卖出 =====")
-    # test_trade_futures()
+    # —— 如果想单独测试 Spot 下单，可以取消下面两行注释 —— #
+    # print("\n===== 开始测试：Spot 市价买入 1 ADA，3 秒后卖出 =====")
+    # test_trade_spot()
