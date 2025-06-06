@@ -118,7 +118,7 @@ def compute_indicators(df: pd.DataFrame):
 
     # 5. 其余条件
     df["brokenBB"] = df["low"] < df["lowerBB"]
-    df["vol_increasing"] = df["volume"] > df["volume"].shift(1) * 1.5
+    df["vol_increasing"] = df["volume"] > df["volume"].shift(1) * 1.45
     df["vol_over_20m"] = df["volume"] > 20_000_000
 
     return df
