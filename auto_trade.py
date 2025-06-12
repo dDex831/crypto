@@ -312,7 +312,7 @@ def main():
     # 10.4 根据信号下单（Spot）
     # ============================
     if action == "BUY_MOM":
-        usdt_amount = 200
+        usdt_amount = 320
         qty = calc_quantity(usdt_amount, price)
         order = place_order_spot("BUY", SYMBOL, qty)
         if order:
@@ -334,7 +334,7 @@ def main():
             print(f"{datetime.now()} 记录动量仓（现货）：入场价 {avg_price:.6f}, 数量 {total_qty:.3f}, 时间 {state['entryTime']}")
 
     elif action == "BUY_ORIG":
-        usdt_amount = 200
+        usdt_amount = 320
         qty = calc_quantity(usdt_amount, price)
         order = place_order_spot("BUY", SYMBOL, qty)
         if order:
